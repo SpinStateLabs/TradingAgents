@@ -217,3 +217,14 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# --- SpinTrader ---
+.env.spintrader
+data/
+*.parquet
+*.duckdb
+research_cache/
+logs/
+.pgpass_value
+.ibkr.local
+.ibkr

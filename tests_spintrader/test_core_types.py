@@ -1,0 +1,343 @@
+"""Tests for the core domain types.
+
+Position arithmetic gets the heaviest coverage here. It is the one piece of
+code where a subtle sign error produces a ledger that looks plausible, passes
+reconciliation against a venue that only reports net quantity, and silently
+misreports P&L to the self-improvement loop -- which then optimises against
+fiction.
+"""
+
+from __future__ import annotations
+
+import unittest
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+from spintrader.core.types import (
+    Action, AssetClass, Bar, Decision, Fill, Instrument, Order, OrderStatus,
+    OrderType, Position, Quote, Side, TradingMode, VenueId, ensure_utc,
+    to_decimal, utcnow,
+)
+
+D = Decimal
+T0 = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+
+BTC = Instrument(
+    symbol="BTC-USD",
+    asset_class=AssetClass.CRYPTO,
+    venue=VenueId.KRAKEN,
+    venue_symbol="XBTUSD",
+    price_increment=D("0.1"),
+    qty_increment=D("0.00000001"),
+    taker_fee=D("0.0026"),
+)
+
+
+def fill(side: Side, qty: str, price: str, *, fee: str = "0", offset_s: int = 0) -> Fill:
+    return Fill(
+        order_id="o1",
+        instrument_key=BTC.key,
+        side=side,
+        qty=D(qty),
+        price=D(price),
+        ts=T0 + timedelta(seconds=offset_s),
+        fee=D(fee),
+    )
+
+
+class ConversionTests(unittest.TestCase):
+    def test_float_conversion_avoids_binary_expansion(self):
+        # The whole reason to_decimal exists: Decimal(0.1) would give
+        # 0.1000000000000000055511151231257827021181583404541015625.
+        self.assertEqual(to_decimal(0.1), D("0.1"))
+        self.assertEqual(to_decimal(1.1) + to_decimal(2.2), D("3.3"))
+
+    def test_rejects_junk(self):
+        with self.assertRaises(ValueError):
+            to_decimal("not-a-number")
+
+    def test_ensure_utc_rejects_naive(self):
+        with self.assertRaises(ValueError):
+            ensure_utc(datetime(2026, 7, 1, 12, 0))
+
+    def test_ensure_utc_normalises_offset(self):
+        est = timezone(timedelta(hours=-5))
+        got = ensure_utc(datetime(2026, 7, 1, 7, 0, tzinfo=est))
+        self.assertEqual(got, T0)
+        self.assertIs(got.tzinfo, timezone.utc)
+
+    def test_utcnow_is_aware(self):
+        self.assertIsNotNone(utcnow().tzinfo)
+
+
+class SideTests(unittest.TestCase):
+    def test_sign_and_opposite(self):
+        self.assertEqual(Side.BUY.sign, 1)
+        self.assertEqual(Side.SELL.sign, -1)
+        self.assertIs(Side.BUY.opposite, Side.SELL)
+        self.assertIs(Side.SELL.opposite, Side.BUY)
+
+
+class InstrumentTests(unittest.TestCase):
+    def test_key_is_venue_qualified(self):
+        self.assertEqual(BTC.key, "kraken:BTC-USD")
+
+    def test_base_currency_inferred_from_pair(self):
+        self.assertEqual(BTC.base_currency, "BTC")
+
+    def test_base_currency_not_inferred_for_equity(self):
+        aapl = Instrument("AAPL", AssetClass.EQUITY, VenueId.IBKR, "AAPL")
+        self.assertIsNone(aapl.base_currency)
+
+
+class BarTests(unittest.TestCase):
+    def test_rejects_inverted_high_low(self):
+        with self.assertRaises(ValueError):
+            Bar(BTC.key, T0, "1h", D("100"), high=D("99"), low=D("101"),
+                close=D("100"), volume=D("1"))
+
+    def test_normalises_timestamp(self):
+        est = timezone(timedelta(hours=-5))
+        bar = Bar(BTC.key, datetime(2026, 7, 1, 7, 0, tzinfo=est), "1h",
+                  D("100"), D("101"), D("99"), D("100"), D("1"))
+        self.assertEqual(bar.ts, T0)
+
+
+class QuoteTests(unittest.TestCase):
+    def test_mid_spread_and_bps(self):
+        q = Quote(BTC.key, T0, bid=D("99.90"), ask=D("100.10"))
+        self.assertEqual(q.mid, D("100.00"))
+        self.assertEqual(q.spread, D("0.20"))
+        self.assertEqual(q.spread_bps, D("20"))
+
+    def test_spread_bps_safe_at_zero_mid(self):
+        q = Quote(BTC.key, T0, bid=D("0"), ask=D("0"))
+        self.assertEqual(q.spread_bps, D("0"))
+
+
+class OrderTests(unittest.TestCase):
+    def test_rejects_nonpositive_qty(self):
+        for bad in ("0", "-1"):
+            with self.subTest(qty=bad):
+                with self.assertRaises(ValueError):
+                    Order(BTC, Side.BUY, D(bad))
+
+    def test_limit_order_requires_price(self):
+        with self.assertRaises(ValueError):
+            Order(BTC, Side.BUY, D("1"), order_type=OrderType.LIMIT)
+
+    def test_stop_order_requires_stop_price(self):
+        with self.assertRaises(ValueError):
+            Order(BTC, Side.SELL, D("1"), order_type=OrderType.STOP)
+
+    def test_market_order_has_no_intrinsic_notional(self):
+        # The risk engine must supply a reference quote for market orders;
+        # silently returning zero here would let them bypass notional caps.
+        self.assertIsNone(Order(BTC, Side.BUY, D("1")).notional)
+
+    def test_limit_order_notional(self):
+        o = Order(BTC, Side.BUY, D("0.5"), order_type=OrderType.LIMIT, limit_price=D("60000"))
+        self.assertEqual(o.notional, D("30000"))
+
+    def test_client_order_id_autogenerated(self):
+        self.assertTrue(Order(BTC, Side.BUY, D("1")).client_order_id.startswith("st-"))
+
+    def test_partial_then_full_fill_vwaps_price(self):
+        o = Order(BTC, Side.BUY, D("2"))
+        f1 = Fill("x", BTC.key, Side.BUY, D("1"), D("100"), T0, fee=D("0.26"))
+        object.__setattr__(f1, "order_id", o.order_id)
+        o.apply_fill(f1)
+        self.assertEqual(o.status, OrderStatus.PARTIALLY_FILLED)
+        self.assertEqual(o.remaining_qty, D("1"))
+
+        f2 = Fill("x", BTC.key, Side.BUY, D("1"), D("110"), T0, fee=D("0.29"))
+        object.__setattr__(f2, "order_id", o.order_id)
+        o.apply_fill(f2)
+        self.assertEqual(o.status, OrderStatus.FILLED)
+        self.assertEqual(o.avg_fill_price, D("105"))
+        self.assertEqual(o.fees_paid, D("0.55"))
+        self.assertTrue(o.is_terminal)
+
+    def test_rejects_overfill(self):
+        o = Order(BTC, Side.BUY, D("1"))
+        f = Fill("x", BTC.key, Side.BUY, D("2"), D("100"), T0)
+        object.__setattr__(f, "order_id", o.order_id)
+        with self.assertRaises(ValueError):
+            o.apply_fill(f)
+
+    def test_rejects_foreign_fill(self):
+        o = Order(BTC, Side.BUY, D("1"))
+        with self.assertRaises(ValueError):
+            o.apply_fill(Fill("someone-else", BTC.key, Side.BUY, D("1"), D("100"), T0))
+
+
+class FillTests(unittest.TestCase):
+    def test_cash_delta_buy_spends_and_pays_fee(self):
+        f = fill(Side.BUY, "2", "100", fee="0.52")
+        self.assertEqual(f.notional, D("200"))
+        self.assertEqual(f.signed_qty, D("2"))
+        self.assertEqual(f.cash_delta, D("-200.52"))
+
+    def test_cash_delta_sell_receives_less_fee(self):
+        f = fill(Side.SELL, "2", "100", fee="0.52")
+        self.assertEqual(f.signed_qty, D("-2"))
+        self.assertEqual(f.cash_delta, D("199.48"))
+
+    def test_rejects_nonpositive_qty(self):
+        with self.assertRaises(ValueError):
+            Fill("o", BTC.key, Side.BUY, D("0"), D("100"), T0)
+
+
+class PositionOpenAndAddTests(unittest.TestCase):
+    def test_open_long(self):
+        p = Position(BTC.key)
+        realized = p.apply_fill(fill(Side.BUY, "1", "100"))
+        self.assertEqual(realized, D("0"))
+        self.assertEqual(p.qty, D("1"))
+        self.assertEqual(p.avg_cost, D("100"))
+        self.assertTrue(p.is_long)
+
+    def test_open_short(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.SELL, "1", "100"))
+        self.assertEqual(p.qty, D("-1"))
+        self.assertEqual(p.avg_cost, D("100"))
+        self.assertFalse(p.is_long)
+
+    def test_add_to_long_weight_averages_cost(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.BUY, "1", "100"))
+        p.apply_fill(fill(Side.BUY, "3", "200", offset_s=1))
+        self.assertEqual(p.qty, D("4"))
+        self.assertEqual(p.avg_cost, D("175"))          # (100 + 600) / 4
+        self.assertEqual(p.cost_basis, D("700"))
+
+    def test_add_to_short_weight_averages_cost(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.SELL, "1", "100"))
+        p.apply_fill(fill(Side.SELL, "1", "200", offset_s=1))
+        self.assertEqual(p.qty, D("-2"))
+        self.assertEqual(p.avg_cost, D("150"))
+
+
+class PositionCloseTests(unittest.TestCase):
+    def test_partial_close_of_long_realizes_proportional_gain(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.BUY, "4", "100"))
+        realized = p.apply_fill(fill(Side.SELL, "1", "150", offset_s=1))
+        self.assertEqual(realized, D("50"))
+        self.assertEqual(p.realized_pnl, D("50"))
+        self.assertEqual(p.qty, D("3"))
+        # Cost basis of the remainder must be untouched by a partial close.
+        self.assertEqual(p.avg_cost, D("100"))
+
+    def test_full_close_of_long_flattens(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.BUY, "2", "100"))
+        realized = p.apply_fill(fill(Side.SELL, "2", "120", offset_s=1))
+        self.assertEqual(realized, D("40"))
+        self.assertTrue(p.is_flat)
+        self.assertEqual(p.avg_cost, D("0"))
+
+    def test_short_profits_when_price_falls(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.SELL, "2", "100"))
+        realized = p.apply_fill(fill(Side.BUY, "2", "80", offset_s=1))
+        self.assertEqual(realized, D("40"))     # shorted at 100, covered at 80
+        self.assertTrue(p.is_flat)
+
+    def test_short_loses_when_price_rises(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.SELL, "2", "100"))
+        realized = p.apply_fill(fill(Side.BUY, "2", "130", offset_s=1))
+        self.assertEqual(realized, D("-60"))
+
+
+class PositionFlipTests(unittest.TestCase):
+    """Flipping through zero -- the case naive implementations get wrong."""
+
+    def test_long_to_short_realizes_only_the_closed_portion(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.BUY, "2", "100"))
+        # Sell 5: closes the 2 long (realizing 2 x 50) and opens 3 short at 150.
+        realized = p.apply_fill(fill(Side.SELL, "5", "150", offset_s=1))
+        self.assertEqual(realized, D("100"))
+        self.assertEqual(p.qty, D("-3"))
+        # The new short must be based at the fill price, not the old long cost.
+        self.assertEqual(p.avg_cost, D("150"))
+
+    def test_short_to_long_realizes_only_the_closed_portion(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.SELL, "2", "100"))
+        # Buy 5: covers the 2 short (realizing 2 x 20) and opens 3 long at 80.
+        realized = p.apply_fill(fill(Side.BUY, "5", "80", offset_s=1))
+        self.assertEqual(realized, D("40"))
+        self.assertEqual(p.qty, D("3"))
+        self.assertEqual(p.avg_cost, D("80"))
+
+    def test_round_trip_through_flip_conserves_pnl(self):
+        # Long 2 @100 -> flip to short 3 @150 -> cover @120.
+        # Leg 1: +100. Leg 2: short 3 from 150 to 120 = +90. Total +190.
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.BUY, "2", "100"))
+        p.apply_fill(fill(Side.SELL, "5", "150", offset_s=1))
+        p.apply_fill(fill(Side.BUY, "3", "120", offset_s=2))
+        self.assertEqual(p.realized_pnl, D("190"))
+        self.assertTrue(p.is_flat)
+
+
+class PositionValuationTests(unittest.TestCase):
+    def test_unrealized_pnl_long_and_short(self):
+        long_p = Position(BTC.key, qty=D("2"), avg_cost=D("100"), last_price=D("110"))
+        self.assertEqual(long_p.unrealized_pnl(), D("20"))
+        self.assertEqual(long_p.market_value(), D("220"))
+
+        short_p = Position(BTC.key, qty=D("-2"), avg_cost=D("100"), last_price=D("110"))
+        self.assertEqual(short_p.unrealized_pnl(), D("-20"))
+        self.assertEqual(short_p.market_value(), D("-220"))
+
+    def test_valuation_without_price_is_zero_not_an_error(self):
+        p = Position(BTC.key, qty=D("2"), avg_cost=D("100"))
+        self.assertEqual(p.unrealized_pnl(), D("0"))
+        self.assertEqual(p.market_value(), D("0"))
+
+    def test_explicit_price_overrides_last(self):
+        p = Position(BTC.key, qty=D("2"), avg_cost=D("100"), last_price=D("110"))
+        self.assertEqual(p.unrealized_pnl(D("90")), D("-20"))
+
+    def test_fees_accumulate_across_fills(self):
+        p = Position(BTC.key)
+        p.apply_fill(fill(Side.BUY, "1", "100", fee="0.26"))
+        p.apply_fill(fill(Side.SELL, "1", "110", fee="0.29", offset_s=1))
+        self.assertEqual(p.fees_paid, D("0.55"))
+        # Gross P&L is reported separately from fees; netting is the ledger's job.
+        self.assertEqual(p.realized_pnl, D("10"))
+
+
+class DecisionTests(unittest.TestCase):
+    def test_confidence_must_be_a_probability(self):
+        for bad in ("-0.1", "1.1"):
+            with self.subTest(confidence=bad):
+                with self.assertRaises(ValueError):
+                    Decision(BTC.key, Action.BUY, D(bad))
+
+    def test_accepts_bounds(self):
+        for good in ("0", "1", "0.5"):
+            with self.subTest(confidence=good):
+                Decision(BTC.key, Action.BUY, D(good))
+
+    def test_ids_are_unique(self):
+        a = Decision(BTC.key, Action.BUY, D("0.6"))
+        b = Decision(BTC.key, Action.BUY, D("0.6"))
+        self.assertNotEqual(a.decision_id, b.decision_id)
+
+
+class TradingModeTests(unittest.TestCase):
+    def test_only_live_is_unsimulated(self):
+        self.assertTrue(TradingMode.PAPER.is_simulated)
+        self.assertTrue(TradingMode.BACKTEST.is_simulated)
+        self.assertFalse(TradingMode.LIVE.is_simulated)
+
+
+if __name__ == "__main__":
+    unittest.main()

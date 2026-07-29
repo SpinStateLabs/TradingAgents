@@ -30,13 +30,40 @@ dependencies = [
     "tqdm>=4.67.1",
     "typing-extensions>=4.14.0",
     "yfinance>=0.2.63",
+    # --- SpinTrader additions ---
+    # Venues
+    "ccxt>=4.4.0",            # Kraken REST/WS (also gives us a fallback venue set)
+    # ib_async, not ib_insync: the original is built on a legacy TWS API
+    # release and is no longer maintained. ib_async is the continuation by one
+    # of its original developers, tracking supported TWS releases.
+    "ib_async>=1.0.1",        # IBKR Gateway/TWS API
+    "websockets>=13.0",
+    "aiohttp>=3.10",
+    # Storage
+    "psycopg[binary,pool]>=3.2",
+    "pyarrow>=17.0",
+    "polars>=1.9",
+    # Quant / Markovian layer
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "hmmlearn>=0.3.2",        # baseline HMM; the GPU path lives in spintrader.quant
+    "statsmodels>=0.14",      # Markov-switching regression / MS-GARCH baselines
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
 ]
 
 [project.scripts]
 tradingagents = "cli.main:app"
+spintrader = "spintrader.cli:app"
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "spintrader*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
