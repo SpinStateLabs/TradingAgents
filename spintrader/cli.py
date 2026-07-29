@@ -179,6 +179,89 @@ def cmd_balances(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_data_backfill(args: argparse.Namespace) -> int:
+    """Ingest history for the configured universe.
+
+    Two sources with distinct roles: yfinance supplies deep daily history for
+    model fitting, Kraken supplies recent intraday bars at the prices we will
+    actually trade against. Kraken's 720-bar ceiling is reported per symbol so
+    a thin result is visibly an API limit rather than a missing asset.
+    """
+    from spintrader.data import kraken_feed, yfinance_feed
+    from spintrader.data.store import Store
+    from spintrader.venues.kraken import KrakenVenue
+
+    settings = Settings.from_env()
+    store = Store(settings.storage)
+    store.connect()
+    if args.migrate:
+        store.migrate()
+
+    venue = KrakenVenue(settings=settings)
+    venue.connect()
+
+    crypto = list(args.symbols) or list(settings.crypto_universe)
+    equities = [] if args.symbols else list(settings.equity_universe)
+
+    print("=" * 78)
+    print(f"{BOLD}Backfill{RESET}  crypto={len(crypto)}  equities={len(equities)}  "
+          f"years={args.years}")
+    print("=" * 78)
+    print(f"  {'SYMBOL':<10}{'SOURCE':<10}{'INT':<5}{'NEW':>7}{'TOTAL':>8}  RANGE")
+    print("-" * 78)
+
+    failures = 0
+
+    def report(symbol, source, interval, result):
+        span = (f"{result['first']:%Y-%m-%d} .. {result['last']:%Y-%m-%d}"
+                if result.get("first") else "empty")
+        flag = f"  {YELLOW}[api limit]{RESET}" if result.get("reached_api_limit") else ""
+        print(f"  {symbol:<10}{source:<10}{interval:<5}"
+              f"{result['written']:>7}{result['bars']:>8}  {span}{flag}")
+
+    for symbol in crypto:
+        try:
+            instrument = venue.resolve(symbol)
+        except VenueError as exc:
+            print(f"  {symbol:<10}{RED}unavailable{RESET}: {exc}")
+            failures += 1
+            continue
+        try:
+            report(symbol, "yfinance", "1d",
+                   yfinance_feed.backfill(store, instrument, years=args.years))
+        except Exception as exc:                        # noqa: BLE001 - reported
+            print(f"  {symbol:<10}{'yfinance':<10}{RED}failed{RESET}: {str(exc)[:40]}")
+            failures += 1
+        try:
+            report(symbol, "kraken", args.interval,
+                   kraken_feed.backfill(store, venue, symbol, interval=args.interval))
+        except Exception as exc:                        # noqa: BLE001 - reported
+            print(f"  {symbol:<10}{'kraken':<10}{RED}failed{RESET}: {str(exc)[:40]}")
+            failures += 1
+
+    # Equities come from yfinance only: IBKR historical data needs market-data
+    # subscriptions the account deliberately does not have.
+    for symbol in equities:
+        from spintrader.core.types import AssetClass, Instrument, VenueId
+        instrument = Instrument(
+            symbol=symbol, asset_class=AssetClass.EQUITY, venue=VenueId.IBKR,
+            venue_symbol=symbol, quote_currency="USD",
+            price_increment=Decimal("0.01"), qty_increment=Decimal("0.0001"),
+            min_notional=Decimal("1"),
+        )
+        try:
+            report(symbol, "yfinance", "1d",
+                   yfinance_feed.backfill(store, instrument, years=args.years))
+        except Exception as exc:                        # noqa: BLE001 - reported
+            print(f"  {symbol:<10}{'yfinance':<10}{RED}failed{RESET}: {str(exc)[:40]}")
+            failures += 1
+
+    store.close()
+    print("=" * 78)
+    print(f"{'RESULT: PASS' if not failures else f'RESULT: {failures} failure(s)'}")
+    return 1 if failures else 0
+
+
 def cmd_quote(args: argparse.Namespace) -> int:
     venue = KrakenVenue(settings=Settings.from_env())
     venue.connect()
@@ -219,6 +302,15 @@ def build_parser() -> argparse.ArgumentParser:
     quote = sub.add_parser("quote", help="show top of book for a symbol")
     quote.add_argument("symbol")
     quote.set_defaults(func=cmd_quote)
+
+    data = sub.add_parser("data", help="market data ingestion")
+    dsub = data.add_subparsers(dest="data_command", required=True)
+    backfill = dsub.add_parser("backfill", help="ingest history for the universe")
+    backfill.add_argument("symbols", nargs="*", help="symbols (default: configured universe)")
+    backfill.add_argument("--years", type=int, default=5, help="years of daily history")
+    backfill.add_argument("--interval", default="1h", help="kraken intraday interval")
+    backfill.add_argument("--migrate", action="store_true", help="apply the schema first")
+    backfill.set_defaults(func=cmd_data_backfill)
 
     return parser
 
