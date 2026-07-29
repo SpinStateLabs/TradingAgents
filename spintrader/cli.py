@@ -262,6 +262,43 @@ def cmd_data_backfill(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def cmd_data_collect(args: argparse.Namespace) -> int:
+    """Run the WebSocket minute collector until interrupted.
+
+    Intended to run continuously as a service. Kraken's REST OHLC endpoint
+    only reaches back 720 bars — twelve hours at 1-minute resolution — so
+    minute history can only be accumulated forward. Downtime is permanent
+    data loss, not a delay.
+    """
+    import asyncio
+    import logging
+
+    from spintrader.data.kraken_ws import collect
+    from spintrader.data.store import Store
+
+    settings = Settings.from_env()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    store = Store(settings.storage)
+    store.connect()
+    symbols = list(args.symbols) or list(settings.crypto_universe)
+    print(f"collecting {args.interval}m bars for {', '.join(symbols)}")
+
+    try:
+        stats = asyncio.run(collect(symbols, store, interval_minutes=args.interval))
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        return 0
+    finally:
+        store.close()
+
+    print(f"stats: {stats.as_dict()}")
+    return 0
+
+
 def cmd_quote(args: argparse.Namespace) -> int:
     venue = KrakenVenue(settings=Settings.from_env())
     venue.connect()
@@ -311,6 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--interval", default="1h", help="kraken intraday interval")
     backfill.add_argument("--migrate", action="store_true", help="apply the schema first")
     backfill.set_defaults(func=cmd_data_backfill)
+
+    collect = dsub.add_parser("collect", help="stream and store live bars (long running)")
+    collect.add_argument("symbols", nargs="*", help="symbols (default: crypto universe)")
+    collect.add_argument("--interval", type=int, default=1, help="bar interval in minutes")
+    collect.set_defaults(func=cmd_data_collect)
 
     return parser
 

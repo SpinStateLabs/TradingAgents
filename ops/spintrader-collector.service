@@ -1,0 +1,54 @@
+# systemd user unit for the minute-bar collector.
+#
+# Install on the GB10:
+#   mkdir -p ~/.config/systemd/user
+#   cp ops/spintrader-collector.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now spintrader-collector
+#   loginctl enable-linger spinner     # survive logout / run at boot
+#
+# Watch it:
+#   systemctl --user status spintrader-collector
+#   journalctl --user -u spintrader-collector -f
+#
+# Why a service rather than a cron job: minute history can only be accumulated
+# forward, since Kraken's REST OHLC endpoint reaches back just 720 bars. Any
+# downtime is permanent data loss, so this is designed to restart aggressively
+# and never give up.
+
+[Unit]
+Description=SpinTrader Kraken minute-bar collector
+After=network-online.target
+Wants=network-online.target
+
+# Never stop retrying. This belongs in [Unit], not [Service] -- systemd
+# silently ignores it under [Service] and falls back to the default
+# StartLimitBurst, which gives up after 5 failures in 10s and would leave a
+# multi-hour hole in the data during a database outage.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/spinner/spintrader-src
+Environment=PYTHONPATH=/home/spinner/spintrader-src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/spinner/spintrader-src/.venv/bin/python -m spintrader.cli data collect
+
+# Always come back. The collector already reconnects internally with backoff;
+# this covers the cases it cannot (OOM kill, database outage on startup, a
+# crash in a dependency).
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spintrader-collector
+
+# Modest hardening. The process needs outbound network and the project
+# directory; nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
