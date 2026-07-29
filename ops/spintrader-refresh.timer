@@ -1,0 +1,16 @@
+[Unit]
+Description=SpinTrader daily data refresh schedule
+
+[Timer]
+# 22:30 America/Toronto is comfortably after the 16:00 US equity close, so
+# yfinance has settled daily bars rather than a partially-formed session.
+# Crypto is continuous, so any fixed time works for it.
+OnCalendar=*-*-* 22:30:00
+Persistent=true
+
+# Spread the start so a fleet of these would not hit yfinance simultaneously,
+# and so a restart at 22:30 does not collide with the scheduled run.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

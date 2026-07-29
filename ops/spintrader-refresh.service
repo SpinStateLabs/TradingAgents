@@ -1,0 +1,27 @@
+# One-shot daily data refresh. Paired with spintrader-refresh.timer.
+#
+# A timer rather than a long-lived poller: a crashed poller stops ingesting
+# silently, whereas a failed timer run is visible in `systemctl --user
+# list-timers` and the next run still fires.
+#
+# Install on the GB10:
+#   cp ops/spintrader-refresh.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now spintrader-refresh.timer
+
+[Unit]
+Description=SpinTrader daily market data refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/spinner/spintrader-src
+Environment=PYTHONPATH=/home/spinner/spintrader-src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/spinner/spintrader-src/.venv/bin/python -m spintrader.cli data backfill --years 5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spintrader-refresh
+NoNewPrivileges=yes
+PrivateTmp=yes
