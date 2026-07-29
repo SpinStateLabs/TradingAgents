@@ -608,16 +608,185 @@ DRUCKENMILLER = PersonaSpec(
 )
 
 
+# --------------------------------------------------------------------------
+# Policy reaction functions
+# --------------------------------------------------------------------------
+#
+# These two differ in kind from the investor personas. They do not express a
+# view on value; they forecast what a central bank will DO given the incoming
+# data, and derive an asset implication from that. Their output is a
+# conditional: "if the reaction function holds, rates go here, and this asset
+# reprices."
+#
+# Modelling the reaction function rather than the personality is what makes
+# them testable. A reaction function has observable inputs and a falsifiable
+# output; a personality does not.
+
+FED_CHAIR = PersonaSpec(
+    key="fed_chair",
+    display_name="FOMC Reaction Function",
+    attribution=(
+        "The Federal Reserve's published dual mandate and reaction function "
+        "(FOMC statements, minutes, Summary of Economic Projections)"
+    ),
+    thesis=(
+        "The Fed responds to the gap between realised inflation and 2% and the "
+        "gap between employment and its maximum sustainable level; forecast the "
+        "policy path from those gaps, not from commentary about them."
+    ),
+    method=(
+        "State current core inflation and its trend against the 2% target.",
+        "State labour market slack: unemployment relative to estimated natural "
+        "rate, participation, wage growth.",
+        "Derive the implied policy stance from the dual mandate, noting where "
+        "the two mandates conflict — that conflict is where the Fed becomes "
+        "unpredictable and where the market misprices.",
+        "Compare your implied path to what is already priced in forwards; only "
+        "the difference is tradeable.",
+        "Weigh financial-stability considerations, which override the dual "
+        "mandate in a crisis and are the usual reason the Fed surprises.",
+    ),
+    lenses=(Lens.MACRO, Lens.FLOW),
+    native_horizon=Horizon.MONTHS,
+    min_horizon=Horizon.WEEKS,
+    max_horizon=Horizon.YEARS,
+    asset_classes=ALL_LIQUID,
+    contrarian=D("0.35"),
+    concentration=D("0.3"),
+    patience=D("0.7"),
+    conviction_threshold=D("0.6"),
+    invalidation=(
+        "Incoming inflation or employment data contradicts the gaps your path "
+        "was derived from.",
+        "The expected path is already fully priced in forwards, leaving no "
+        "differential to trade.",
+        "A financial-stability event has displaced the dual mandate entirely.",
+    ),
+    known_failure_modes=(
+        "The Fed deviates from any mechanical reaction function precisely when "
+        "it matters most, and those deviations are what move markets.",
+        "Rate expectations are among the most efficiently priced things in "
+        "markets, so an edge here requires a genuinely differentiated read "
+        "rather than a competent one.",
+        "Says little about crypto except through the liquidity channel, which "
+        "is real but slow and easily swamped.",
+    ),
+)
+
+
+BOC_GOVERNOR = PersonaSpec(
+    key="boc_governor",
+    display_name="Bank of Canada Reaction Function",
+    attribution=(
+        "The Bank of Canada's inflation-targeting framework (2% midpoint of a "
+        "1-3% control range; Monetary Policy Reports)"
+    ),
+    thesis=(
+        "The Bank of Canada targets inflation within a control range with a "
+        "single mandate, and is constrained by household leverage and by "
+        "divergence from the Fed; forecast from those three."
+    ),
+    method=(
+        "State CPI and core measures against the 2% midpoint and the 1-3% band.",
+        "Assess household debt service and housing sensitivity, which bind "
+        "Canadian policy far more tightly than US policy.",
+        "Measure the CAD/USD rate and the BoC-Fed policy differential; "
+        "sustained divergence transmits through the currency and eventually "
+        "forces convergence.",
+        "Derive the implied path, then compare it to market pricing.",
+        "Translate the result into a CAD implication, since CAD-denominated "
+        "holdings are directly exposed to it.",
+    ),
+    lenses=(Lens.MACRO, Lens.FLOW),
+    native_horizon=Horizon.MONTHS,
+    min_horizon=Horizon.WEEKS,
+    max_horizon=Horizon.YEARS,
+    asset_classes=ALL_LIQUID,
+    contrarian=D("0.35"),
+    concentration=D("0.3"),
+    patience=D("0.7"),
+    conviction_threshold=D("0.6"),
+    invalidation=(
+        "Canadian CPI moves outside the range your path assumed.",
+        "The BoC-Fed differential has closed, removing the currency pressure.",
+        "Housing or household credit stress has become the binding constraint, "
+        "overriding the inflation target.",
+    ),
+    known_failure_modes=(
+        "A small open economy's central bank has limited independence from the "
+        "Fed, so this persona is often just a lagged Fed call wearing a maple "
+        "leaf.",
+        "Its main value on this book is the CAD exposure of the IBKR account "
+        "rather than any tradeable directional edge.",
+    ),
+)
+
+
+BUENO_DE_MESQUITA = PersonaSpec(
+    key="bueno_de_mesquita",
+    display_name="Game-Theoretic Political Forecast",
+    attribution=(
+        "Bruce Bueno de Mesquita (expected-utility / stakeholder bargaining "
+        "models for forecasting political outcomes; The Predictioneer's Game)"
+    ),
+    thesis=(
+        "Political outcomes are predictable from the incentives of the actors "
+        "who can influence them; model positions, salience and clout, and the "
+        "bargaining result follows — regardless of what anyone says publicly."
+    ),
+    method=(
+        "Enumerate every actor who can materially influence the outcome, "
+        "including ones with no formal authority.",
+        "For each, estimate three quantities: preferred position on the issue, "
+        "how much they care (salience), and how much influence they can bring "
+        "(clout).",
+        "Ignore stated positions where they diverge from revealed incentives; "
+        "rhetoric is cheap and is usually aimed at a domestic audience.",
+        "Find the bargaining equilibrium those incentives imply, not the "
+        "outcome that seems fair or that commentary expects.",
+        "State the forecast as a probability over discrete outcomes with a "
+        "timeframe, then derive which assets reprice under each.",
+    ),
+    lenses=(Lens.STRUCTURAL, Lens.NARRATIVE, Lens.MACRO),
+    native_horizon=Horizon.MONTHS,
+    min_horizon=Horizon.WEEKS,
+    max_horizon=Horizon.YEARS,
+    asset_classes=ALL_LIQUID,
+    contrarian=D("0.7"),
+    concentration=D("0.5"),
+    patience=D("0.7"),
+    conviction_threshold=D("0.65"),
+    invalidation=(
+        "The set of influential actors was wrong, or a decisive one was omitted.",
+        "An actor's revealed behaviour contradicts the estimated salience or "
+        "clout.",
+        "The forecast timeframe has passed without the predicted outcome.",
+    ),
+    known_failure_modes=(
+        "Output quality depends entirely on the actor estimates, and those are "
+        "judgement calls dressed as parameters — the model's rigour can lend "
+        "false precision to guesses.",
+        "Forecasts a political outcome, not a price. The step from 'this policy "
+        "passes' to 'this asset moves' is a separate inference and often the "
+        "weaker one.",
+        "Timing is coarse; being right about an outcome months early is "
+        "indistinguishable from being wrong while a position carries.",
+    ),
+)
+
+
 def default_roster() -> PersonaRegistry:
     """The standard roster, method-diverse by construction."""
     return PersonaRegistry([
         BURRY, BERKSHIRE, TALEB, MANDELBROT, SIMONS, THORP, DALIO, SOROS,
         TUDOR_JONES, TURTLE, THIEL, POLICY_HEADLINE, MINSKY, DRUCKENMILLER,
+        FED_CHAIR, BOC_GOVERNOR, BUENO_DE_MESQUITA,
     ])
 
 
 __all__ = [
-    "BERKSHIRE", "BURRY", "DALIO", "DRUCKENMILLER", "MANDELBROT", "MINSKY",
-    "POLICY_HEADLINE", "SIMONS", "SOROS", "TALEB", "THIEL", "THORP",
-    "TUDOR_JONES", "TURTLE", "default_roster",
+    "BERKSHIRE", "BOC_GOVERNOR", "BUENO_DE_MESQUITA", "BURRY", "DALIO",
+    "DRUCKENMILLER", "FED_CHAIR", "MANDELBROT", "MINSKY", "POLICY_HEADLINE",
+    "SIMONS", "SOROS", "TALEB", "THIEL", "THORP", "TUDOR_JONES", "TURTLE",
+    "default_roster",
 ]

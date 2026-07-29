@@ -417,6 +417,83 @@ class AttributionTests(unittest.TestCase):
         self.assertIn("no persona voted", decision.rationale)
 
 
+class PolicyReactionFunctionTests(unittest.TestCase):
+    """The central-bank personas forecast policy, not value.
+
+    Modelling a reaction function rather than a personality is what makes them
+    testable: a reaction function has observable inputs and a falsifiable
+    output.
+    """
+
+    def test_fed_derives_a_path_from_the_dual_mandate(self):
+        from spintrader.agents.personas.roster import FED_CHAIR
+        method = " ".join(FED_CHAIR.method).lower()
+        self.assertIn("inflation", method)
+        self.assertIn("labour", method)
+        self.assertIn("dual mandate", method)
+
+    def test_fed_requires_comparison_against_priced_expectations(self):
+        # Rate expectations are efficiently priced; only the differential trades.
+        from spintrader.agents.personas.roster import FED_CHAIR
+        self.assertIn("priced", " ".join(FED_CHAIR.method).lower())
+
+    def test_fed_admits_it_deviates_when_it_matters(self):
+        from spintrader.agents.personas.roster import FED_CHAIR
+        self.assertIn("deviates", " ".join(FED_CHAIR.known_failure_modes).lower())
+
+    def test_boc_accounts_for_household_leverage(self):
+        # The constraint that binds Canadian policy far more than US policy.
+        from spintrader.agents.personas.roster import BOC_GOVERNOR
+        self.assertIn("household", " ".join(BOC_GOVERNOR.method).lower())
+
+    def test_boc_tracks_the_fed_differential(self):
+        from spintrader.agents.personas.roster import BOC_GOVERNOR
+        self.assertIn("differential", " ".join(BOC_GOVERNOR.method).lower())
+
+    def test_boc_admits_limited_independence_from_the_fed(self):
+        from spintrader.agents.personas.roster import BOC_GOVERNOR
+        text = " ".join(BOC_GOVERNOR.known_failure_modes).lower()
+        self.assertIn("independence", text)
+
+    def test_both_abstain_from_hourly_decisions(self):
+        # A policy reaction function has nothing to say about the next hour.
+        from spintrader.agents.personas.roster import BOC_GOVERNOR, FED_CHAIR
+        for spec in (FED_CHAIR, BOC_GOVERNOR):
+            with self.subTest(persona=spec.key):
+                ok, _ = spec.applies_to(CRYPTO, Horizon.INTRADAY)
+                self.assertFalse(ok)
+
+
+class BuenoDeMesquitaTests(unittest.TestCase):
+    def test_attributed_to_bruce_not_another_family_member(self):
+        # Bruce Bueno de Mesquita is the one with the documented forecasting
+        # record from expected-utility stakeholder models.
+        from spintrader.agents.personas.roster import BUENO_DE_MESQUITA
+        self.assertIn("Bruce", BUENO_DE_MESQUITA.attribution)
+
+    def test_models_the_three_stakeholder_quantities(self):
+        from spintrader.agents.personas.roster import BUENO_DE_MESQUITA
+        method = " ".join(BUENO_DE_MESQUITA.method).lower()
+        for quantity in ("position", "salience", "clout"):
+            with self.subTest(quantity=quantity):
+                self.assertIn(quantity, method)
+
+    def test_prefers_revealed_incentives_over_stated_positions(self):
+        from spintrader.agents.personas.roster import BUENO_DE_MESQUITA
+        self.assertIn("rhetoric", " ".join(BUENO_DE_MESQUITA.method).lower())
+
+    def test_admits_false_precision_risk(self):
+        # The model's rigour can lend spurious authority to judgement calls.
+        from spintrader.agents.personas.roster import BUENO_DE_MESQUITA
+        self.assertIn("false precision",
+                      " ".join(BUENO_DE_MESQUITA.known_failure_modes).lower())
+
+    def test_admits_the_gap_between_outcome_and_price(self):
+        from spintrader.agents.personas.roster import BUENO_DE_MESQUITA
+        text = " ".join(BUENO_DE_MESQUITA.known_failure_modes).lower()
+        self.assertIn("not a price", text)
+
+
 class PolicyHeadlineTests(unittest.TestCase):
     """The persona with no documented practitioner gets extra scrutiny."""
 
