@@ -220,7 +220,14 @@ __marimo__/
 
 # --- SpinTrader ---
 .env.spintrader
+# The local data lake (parquet dumps, CSV bar exports, TimescaleDB extracts).
 data/
+# ...but `data/` above also matched the SOURCE package spintrader/data/, which
+# silently excluded the entire data layer (store, feeds, schema) from git. Keep
+# the source tracked; only genuine data files inside it stay ignored.
+!spintrader/data/
+!spintrader/data/*.py
+!spintrader/data/*.sql
 *.parquet
 *.duckdb
 research_cache/
