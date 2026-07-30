@@ -68,6 +68,7 @@ All five passed as of the last session.
 | 12 | Live 1m WebSocket collector | `spintrader/data/kraken_ws.py` |
 | 13 | Deep 1m history from Kraken `/Trades` | `spintrader/data/kraken_trades.py` |
 | 14 | Two-tier decision loop (fast quant + slow LLM mandate) | `spintrader/loop/` |
+| 19 | Improvement cycle: candidate factory, research memory, orchestrator | `spintrader/research/`, `spintrader/loop/improvement.py` |
 
 ---
 
@@ -75,10 +76,6 @@ All five passed as of the last session.
 
 Ordered by dependency.
 
-- **19 — Improvement-cycle orchestrator, agent factory, research memory.** The
-  generative half of the loop; the scoring half is done. Every generated
-  candidate **must** register with `TrialLedger` before evaluation, or the
-  multiple-testing correction can be bypassed by not counting.
 - **15 — Maker-first execution.** 0.16% vs 0.26% is decisive at minute cadence.
 - **16 — LLM recalibration agent** (daily). Guardrails already specified.
 - **17 — News/sentiment ingestion.** Adapt `tradingagents/dataflows/reddit.py`
@@ -151,6 +148,41 @@ trade cap, and directional bias** — pinned by
 `ExitReachabilityUnderEntryGatesTests`. The one remaining halt on an exit is the
 **kill switch**, which is deliberate (a tripped switch means stop and wait for a
 human) and is the sole exception.
+
+---
+
+## Task 19 — the improvement cycle (generative half)
+
+The scoring half (walk-forward backtester, `PromotionGate`, `TrialLedger`,
+reliability tracker) already refused almost everything. This is the generative
+half that feeds it, in `spintrader/research/` and `spintrader/loop/improvement.py`:
+
+* `research/factory.py` — the **agent factory** (v1): enumerates
+  `BaselineTrendAgent` parameter configurations from a bounded grid, in a fixed
+  order, filtering combinations the agent would reject. Each config has a stable
+  content hash. (Generating genuinely new *personas* is the next extension; the
+  interface won't change.)
+* `research/memory.py` — the **research memory**: records every candidate
+  evaluated per objective (promoted or rejected, and why), so a round never
+  re-tests — or re-counts — a configuration. Optionally persisted via the
+  research cache so runs continue the search rather than restart it.
+* `loop/improvement.py` — the **orchestrator**. Each fresh candidate is
+  walk-forward backtested and run through the promotion gate against the current
+  champion (re-backtested for an honest same-data comparison); the best
+  challenger that clears the gate is promoted.
+
+```bash
+python -m spintrader.cli improve SPY --asset-class equity --interval 1d --csv data/SPY_1d.csv
+python -m spintrader.cli improve BTC-USD                    # crypto 1m, from the store
+```
+
+**The load-bearing invariant:** every evaluated candidate is counted as a
+lifetime trial *before* its result can promote anything — the gate increments
+the `TrialLedger` on every `evaluate`, and the only skips are configs already
+evaluated (already counted). Verified against real SPY data: four candidates,
+four trials, deflated Sharpe falling 0.88 → 0.57 as the count rose, all
+rejected. Nothing promoted is the correct, common outcome for a weak family —
+the loop refusing to ship noise is the feature.
 
 ---
 

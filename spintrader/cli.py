@@ -588,6 +588,85 @@ def cmd_loop_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_improve(args: argparse.Namespace) -> int:
+    """Run one improvement round: generate candidates, prove them, promote the best.
+
+    Every candidate is counted as a lifetime trial before it can be promoted, and
+    the deflated Sharpe rises with that count -- so this is deliberately hard to
+    pass, and 'nothing promoted' is the common, correct outcome for a weak
+    strategy family. The research memory is persisted (when reading from the
+    store) so repeated runs continue the search rather than re-testing.
+    """
+    from dataclasses import replace as _replace
+
+    from spintrader.backtest.runner import (
+        backtest_instrument, load_bars_from_csv, load_bars_from_store,
+    )
+    from spintrader.core.types import AssetClass
+    from spintrader.loop.improvement import ImprovementCycle
+    from spintrader.loop.promotion import PromotionGate, TrialLedger
+    from spintrader.research.factory import CandidateFactory
+    from spintrader.research.memory import ResearchMemory
+
+    settings = Settings.from_env()
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    asset_class = AssetClass(args.asset_class)
+    instrument = backtest_instrument(args.symbol, asset_class)
+
+    store = None
+    if args.csv:
+        bars = load_bars_from_csv(args.csv, instrument.key, args.interval)
+        source = args.csv
+    else:
+        source_venue = "kraken" if asset_class is AssetClass.CRYPTO else "ibkr"
+        store_key = f"{source_venue}:{args.symbol}"
+        try:
+            bars = load_bars_from_store(store_key, args.interval, settings=settings)
+        except Exception as exc:                        # noqa: BLE001 - reported
+            print(f"could not read bars from the store: {exc}", file=sys.stderr)
+            print("pass --csv to run without the database", file=sys.stderr)
+            return 1
+        bars = [_replace(b, instrument_key=instrument.key) for b in bars]
+        source = store_key
+        from spintrader.data.store import Store
+        store = Store(settings.storage)
+        store.connect()
+
+    if len(bars) < 2:
+        print(f"{source}: not enough bars ({len(bars)})", file=sys.stderr)
+        return 1
+
+    objective = args.objective or f"{args.symbol}_{args.interval}"
+    gate = PromotionGate(ledger=TrialLedger())
+    memory = ResearchMemory(store=store)
+    loaded = memory.load(objective)
+    cycle = ImprovementCycle(gate=gate, memory=memory, factory=CandidateFactory())
+
+    print("=" * 74)
+    print(f"{BOLD}Improvement round{RESET}  objective '{objective}'  "
+          f"({len(bars)} {args.interval} bars, {loaded} prior trials loaded)")
+    print("=" * 74)
+    result = cycle.run_round(
+        objective, args.symbol, bars, asset_class=asset_class,
+        aggression=args.aggression or settings.aggression,
+        starting_cash=args.cash, n_candidates=args.max_candidates,
+    )
+    print(f"  {result.summary()}")
+    print("-" * 74)
+    for verdict in result.verdicts:
+        colour = GREEN if verdict.promoted else DIM
+        print(f"  {colour}{verdict.summary()[:118]}{RESET}")
+    print("-" * 74)
+    summary = memory.summary(objective)
+    print(f"  lifetime: {summary['evaluated']} evaluated, {summary['promoted']} promoted; "
+          f"rejections {summary['rejections']}")
+    print("=" * 74)
+
+    if store is not None:
+        store.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="spintrader", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -751,6 +830,40 @@ def build_parser() -> argparse.ArgumentParser:
     loop_mandate.add_argument("--with-regime", action="store_true",
                               help="fit the HMM regime model (needs hmmlearn)")
     loop_mandate.set_defaults(func=cmd_loop_mandate)
+
+    improve = sub.add_parser(
+        "improve",
+        help="run one self-improvement round (generate, prove, promote)",
+        description="Generates candidate strategy configurations, evaluates each "
+                    "through the walk-forward backtester and the promotion gate "
+                    "(counting every one as a lifetime trial), and promotes the "
+                    "best that clears the gate. Passing rarely -- the deflated "
+                    "Sharpe rises with the trial count -- is the point.",
+    )
+    improve.add_argument("symbol", help="e.g. SPY or BTC-USD")
+    improve.add_argument(
+        "--asset-class", default="crypto", choices=["equity", "crypto", "etf"],
+        help="selects the cost model and annualisation factor",
+    )
+    improve.add_argument("--interval", default="1m", help="bar interval")
+    improve.add_argument(
+        "--csv", default=None,
+        help="read bars from a CSV instead of the store (no memory persistence)",
+    )
+    improve.add_argument("--cash", default="1000", help="starting capital")
+    improve.add_argument(
+        "--aggression", default=None,
+        choices=["conservative", "moderate", "balanced", "growth", "aggressive"],
+    )
+    improve.add_argument(
+        "--objective", default=None,
+        help="trial-accounting bucket (default: <symbol>_<interval>)",
+    )
+    improve.add_argument(
+        "--max-candidates", type=int, default=None,
+        help="cap candidates evaluated this round (default: all fresh grid points)",
+    )
+    improve.set_defaults(func=cmd_improve)
 
     return parser
 

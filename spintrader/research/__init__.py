@@ -1,0 +1,18 @@
+"""Research: the generative half of the self-improvement loop.
+
+* :mod:`spintrader.research.factory` -- candidate generation (the agent factory)
+* :mod:`spintrader.research.memory`  -- what has been tried and learned
+
+The orchestrator that drives them against the scoring half lives in
+:mod:`spintrader.loop.improvement`.
+"""
+
+from spintrader.research.factory import (
+    BASE_CONFIG, DEFAULT_GRID, CandidateConfig, CandidateFactory,
+)
+from spintrader.research.memory import ResearchMemory, TrialRecord
+
+__all__ = [
+    "BASE_CONFIG", "DEFAULT_GRID", "CandidateConfig", "CandidateFactory",
+    "ResearchMemory", "TrialRecord",
+]
