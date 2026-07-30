@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from spintrader.agents.personas.spec import Horizon
 from spintrader.core.types import AssetClass, Bar, Instrument, to_decimal
@@ -182,11 +182,19 @@ def gather_contexts(
     fast_window: int = 20,
     slow_window: int = 50,
     vol_window: int = 20,
+    data_keys: Mapping[str, str] | None = None,
 ) -> dict[str, MarketContext]:
-    """Read the trailing window for each instrument and build its context."""
+    """Read the trailing window for each instrument and build its context.
+
+    ``data_keys`` maps a trading instrument's key to the store key its bars are
+    ingested under (e.g. ``paper:BTC-USD`` -> ``kraken:BTC-USD``); identity when
+    a key is absent.
+    """
+    data_keys = data_keys or {}
     out: dict[str, MarketContext] = {}
     for instrument in instruments:
-        bars = store.read_bars(instrument.key, interval, limit=lookback)
+        data_key = data_keys.get(instrument.key, instrument.key)
+        bars = store.read_bars(data_key, interval, limit=lookback)
         out[instrument.key] = build_context(
             instrument, bars, interval, horizon,
             fast_window=fast_window, slow_window=slow_window,

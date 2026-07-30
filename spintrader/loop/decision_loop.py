@@ -33,7 +33,7 @@ import contextlib
 import logging
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Callable, Mapping, Sequence
@@ -167,6 +167,7 @@ class DecisionLoop:
         continuous: bool = True,
         with_regime: bool = False,
         quote_provider: Callable[[Instrument, Bar], Quote] | None = None,
+        data_keys: Mapping[str, str] | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -177,6 +178,10 @@ class DecisionLoop:
         self.mandate_service = mandate_service
         self.instruments = list(instruments)
         self.interval = interval
+        # Bars are stored under the ingesting venue's key (kraken:BTC-USD) while
+        # the loop trades a PAPER twin (paper:BTC-USD). This maps a trading
+        # instrument's key to the key its bars live under; identity when unset.
+        self.data_keys = dict(data_keys or {})
         self.spread_bps = to_decimal(spread_bps)
         self.fast_lookback = fast_lookback
         self.context_lookback = context_lookback
@@ -209,7 +214,7 @@ class DecisionLoop:
         contexts = gather_contexts(
             self.store, self.instruments, self.interval, self.horizon,
             lookback=self.context_lookback, continuous=self.continuous,
-            with_regime=self.with_regime,
+            with_regime=self.with_regime, data_keys=self.data_keys,
         )
         self._deliberation = self.mandate_service.deliberate(contexts, now=now)
         return self._deliberation.mandate
@@ -233,7 +238,14 @@ class DecisionLoop:
         bars_by_key: dict[str, list[Bar]] = {}
         marks: dict[str, Decimal] = {}
         for instrument in self.instruments:
-            bars = self.store.read_bars(instrument.key, self.interval, limit=self.fast_lookback)
+            data_key = self.data_keys.get(instrument.key, instrument.key)
+            raw = self.store.read_bars(data_key, self.interval, limit=self.fast_lookback)
+            # Re-key the bars onto the trading instrument so the cursor, quotes,
+            # marks, orders and ledger all agree on one instrument key.
+            bars = (
+                [replace(b, instrument_key=instrument.key) for b in raw]
+                if data_key != instrument.key else raw
+            )
             bars_by_key[instrument.key] = bars
             if bars:
                 quote = self._quote_for(instrument, bars[-1])
@@ -475,16 +487,21 @@ def build_paper_loop(
 ) -> DecisionLoop:
     """Wire a paper-mode loop over Kraken crypto symbols.
 
-    Resolves each symbol to a Kraken instrument (for correct increments and
-    fees), then builds a :class:`PaperVenue`, :class:`Ledger` and
-    :class:`RiskEngine` seeded with the same starting cash -- so the risk state
-    the engine sizes against and the cash the venue fills against never diverge.
-    The mode is forced to PAPER and the live gate stays closed.
+    Trades a PAPER instrument per symbol -- carrying the same crypto cost model
+    the backtester uses, so paper and backtest results are comparable -- while
+    reading bars from the store under the Kraken ingest key (``kraken:BTC-USD``).
+    Builds a :class:`PaperVenue`, :class:`Ledger` and :class:`RiskEngine` seeded
+    with the same starting cash, so the risk state the engine sizes against and
+    the cash the venue fills against never diverge. The mode is forced to PAPER
+    and the live gate stays closed.
+
+    The trading instrument is PAPER-venue on purpose: ``Venue.submit`` refuses an
+    order whose instrument belongs to another venue, so trading Kraken-venue
+    instruments through the PaperVenue would reject every order.
     """
     from spintrader.agents.personas.spec import Horizon
-    from spintrader.backtest.runner import costs_for
+    from spintrader.backtest.runner import backtest_instrument, costs_for
     from spintrader.core.types import AssetClass
-    from spintrader.venues.kraken import KrakenVenue
 
     base = settings or get_settings()
     # Force paper: this helper never builds a live-armed loop.
@@ -507,9 +524,10 @@ def build_paper_loop(
         store = Store(settings.storage)
         store.connect()
 
-    resolver = KrakenVenue(settings=settings)
-    resolver.connect()
-    instruments = [resolver.resolve(symbol) for symbol in symbols]
+    # Trade PAPER twins (correct venue for the PaperVenue, consistent costs),
+    # and remember where each one's bars actually live in the store.
+    instruments = [backtest_instrument(sym, AssetClass.CRYPTO) for sym in symbols]
+    data_keys = {inst.key: f"kraken:{sym}" for inst, sym in zip(instruments, symbols)}
 
     cash = to_decimal(
         starting_cash if starting_cash is not None
@@ -555,7 +573,7 @@ def build_paper_loop(
         settings=settings, store=store, venue=venue, ledger=ledger, risk=risk,
         strategies=strategies, mandate_service=mandate_service,
         instruments=instruments, interval=interval, spread_bps=costs.spread_bps,
-        with_regime=with_regime, horizon=Horizon.INTRADAY,
+        with_regime=with_regime, horizon=Horizon.INTRADAY, data_keys=data_keys,
     )
     loop_holder["loop"] = loop
     return loop

@@ -22,7 +22,7 @@ from spintrader.agents.panel import PanelVerdict, PersonaVote
 from spintrader.backtest.runner import backtest_instrument, costs_for
 from spintrader.core.config import Aggression, LiveGate, Settings
 from spintrader.core.types import (
-    Action, AssetClass, Bar, Side, TradingMode, to_decimal,
+    Action, AssetClass, Bar, Side, TradingMode, VenueId, to_decimal,
 )
 from spintrader.llm.router import LLMResponse, Tier
 from spintrader.loop.context import build_context, gather_contexts
@@ -528,6 +528,53 @@ class ExitReachabilityTests(unittest.TestCase):
         results = loop.fast_tick(expired)
         self.assertTrue(all(not r.submitted for r in results))
         self.assertGreater(ledger.position(inst.key).qty, D("0"))   # trapped, by design
+
+
+class BuildPaperLoopTests(unittest.TestCase):
+    """The wiring the unit tests above bypassed by using backtest_instrument.
+
+    build_paper_loop must trade a PAPER instrument (or Venue.submit rejects it as
+    'submitted to paper') while reading bars stored under the Kraken ingest key.
+    This exercises both halves end-to-end and fills a real order.
+    """
+
+    def _loop(self, bars, **kw):
+        from spintrader.agents.personas.roster import default_roster
+        from spintrader.loop.decision_loop import build_paper_loop
+        # Bars live under the Kraken ingest key, exactly as the collector stores.
+        store = FakeStore({"kraken:BTC-USD": bars})
+        service = MandateService(default_roster(), voter=BootstrapVoter())
+        loop = build_paper_loop(
+            ["BTC-USD"], store=store, mandate_service=service,
+            starting_cash="10000", strategy_factory=lambda: lenient_agent(),
+            **kw,
+        )
+        return loop
+
+    def test_trades_paper_instrument_from_kraken_keyed_bars(self):
+        loop = self._loop(uptrend(60, step=0.3))
+        inst = loop.instruments[0]
+        # The trading instrument is a PAPER twin, mapped to its Kraken data key.
+        self.assertEqual(inst.venue, VenueId.PAPER)
+        self.assertEqual(loop.data_keys[inst.key], "kraken:BTC-USD")
+
+        mandate = loop.refresh_mandate()      # slow loop must find the kraken-keyed bars
+        self.assertIn(inst.key, mandate.permitted)
+
+        results = loop.fast_tick(mandate)
+        # Pre-fix: every order rejected ("order for kraken submitted to paper").
+        self.assertTrue(
+            any(r.submitted and r.filled_qty > D("0") for r in results),
+            f"no order filled: {[r.risk.summary() for r in results]}",
+        )
+        self.assertGreater(loop.ledger.position(inst.key).qty, D("0"))
+
+    def test_slow_loop_permits_from_kraken_keyed_bars(self):
+        # refresh_mandate reads via the data-key map; a trading-key read finds
+        # nothing and would permit nothing.
+        loop = self._loop(uptrend(60, step=0.3))
+        mandate = loop.refresh_mandate()
+        self.assertEqual(set(mandate.permitted), {loop.instruments[0].key})
 
 
 class DriverTests(unittest.TestCase):
