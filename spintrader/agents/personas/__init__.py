@@ -13,10 +13,11 @@ from spintrader.agents.personas.mean_reversion import (
 from spintrader.agents.personas.regime_switch import (
     RegimeSwitchingAgent, RegimeSwitchReading,
 )
+from spintrader.agents.personas.sentiment import SentimentAgent, SentimentReading
 
 __all__ = [
     "BaselineTrendAgent", "HedgeEnsembleAgent", "HedgeReading",
     "HighOrderMarkovAgent", "MarkovReading", "MeanReversionAgent",
     "RegimeSwitchReading", "RegimeSwitchingAgent", "ReversionReading",
-    "TrendReading",
+    "SentimentAgent", "SentimentReading", "TrendReading",
 ]
