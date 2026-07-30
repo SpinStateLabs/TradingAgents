@@ -347,32 +347,47 @@ class RiskEngine:
         if state.equity <= 0:
             return decision.reject("no equity")
 
-        if intent.confidence < profile.min_confidence:
-            return decision.reject(
-                f"confidence {intent.confidence:.2f} below the "
-                f"{profile.min_confidence:.2f} floor for "
-                f"{profile.aggression.value}"
-            )
-
-        if state.trades_today >= profile.max_trades_per_day:
-            return decision.reject(
-                f"daily trade limit reached ({state.trades_today}/"
-                f"{profile.max_trades_per_day})"
-            )
-
-        # Direction must agree with the mandate's bias when one is expressed.
-        bias = mandate.bias_for(intent.instrument.key)
-        if bias != ZERO:
-            wants_long = intent.side is Side.BUY
-            if (bias > ZERO) != wants_long:
-                return decision.reject(
-                    f"{intent.side.value} contradicts the mandate's "
-                    f"{'long' if bias > 0 else 'short'} bias"
-                )
-
-        # --- shorting -----------------------------------------------------
+        # Determine up front whether this trade REDUCES risk. Exits must be
+        # reachable from every state the system can reach (lessons L1). The
+        # gates that follow -- the confidence floor, the daily-trade cap and the
+        # mandate's directional bias -- are all ENTRY controls; applying them to
+        # a risk-reducing trade inverts their purpose exactly as the sizing
+        # candidates once did, and traps the position that most needs closing.
+        # They are therefore skipped for reductions. The kill switch, checked
+        # above, still halts an exit: that single halt is deliberate -- a tripped
+        # switch means stop and wait for a human -- and is the sole exception.
         held = state.positions.get(intent.instrument.key)
         held_qty = held.qty if held else ZERO
+        reducing = (
+            (intent.side is Side.SELL and held_qty > ZERO)
+            or (intent.side is Side.BUY and held_qty < ZERO)
+        )
+
+        if not reducing:
+            if intent.confidence < profile.min_confidence:
+                return decision.reject(
+                    f"confidence {intent.confidence:.2f} below the "
+                    f"{profile.min_confidence:.2f} floor for "
+                    f"{profile.aggression.value}"
+                )
+
+            if state.trades_today >= profile.max_trades_per_day:
+                return decision.reject(
+                    f"daily trade limit reached ({state.trades_today}/"
+                    f"{profile.max_trades_per_day})"
+                )
+
+            # Direction must agree with the mandate's bias when one is expressed.
+            bias = mandate.bias_for(intent.instrument.key)
+            if bias != ZERO:
+                wants_long = intent.side is Side.BUY
+                if (bias > ZERO) != wants_long:
+                    return decision.reject(
+                        f"{intent.side.value} contradicts the mandate's "
+                        f"{'long' if bias > 0 else 'short'} bias"
+                    )
+
+        # --- shorting -----------------------------------------------------
         if intent.side is Side.SELL and held_qty <= ZERO:
             if not profile.allow_shorts or self.settings.enforce_cash_account:
                 return decision.reject(
@@ -388,37 +403,62 @@ class RiskEngine:
                 f"{scaled.max_position_weight / profile.max_position_weight:.0%}"
             )
 
-        # --- candidate sizes ----------------------------------------------
-        candidates: dict[str, Decimal] = {
-            "kelly": self.kelly_size(intent, scaled),
-            "vol_target": self.vol_target_size(intent, scaled),
-            "max_position_weight": scaled.max_position_weight,
-        }
-        candidates["risk_budget"] = (
-            candidates["max_position_weight"] * mandate.risk_budget_multiplier
-        )
-
-        # Room left under the gross exposure ceiling.
-        current_gross = state.gross_exposure()
-        headroom = scaled.max_gross_exposure - current_gross
-        candidates["gross_exposure_headroom"] = max(ZERO, headroom)
-
-        # Room left in this specific name.
         existing_weight = abs(state.weight_of(intent.instrument.key, intent.quote.mid))
-        candidates["position_headroom"] = max(
-            ZERO, scaled.max_position_weight - existing_weight
-        )
 
-        binding = min(candidates, key=lambda k: candidates[k])
-        target_weight = candidates[binding]
-        decision.binding_constraint = binding
-
-        if target_weight <= ZERO:
-            return decision.reject(
-                f"no room to add risk ({binding} is exhausted; "
-                f"gross exposure {current_gross:.0%} of a "
-                f"{scaled.max_gross_exposure:.0%} ceiling)"
+        # --- reductions are not sized like entries -------------------------
+        #
+        # Every candidate below answers one question: "how much *more* risk may
+        # this trade take?" Asked of a trade that *removes* risk, they invert
+        # their own purpose. At ``max_position_weight`` the position headroom is
+        # zero, so an exit -- a trailing stop, a regime flip, a hard stop-loss --
+        # is rejected with "no room to add risk", and the position that most
+        # needs closing is the one that cannot be. Just under the cap only the
+        # unused sliver of budget may be sold, so an exit dribbles out over many
+        # bars while the loss it was meant to stop keeps accruing.
+        #
+        # A reduction is therefore sized off the position it closes. The
+        # held-quantity cap further down still applies, so this can never sell
+        # more than is owned, and the venue minimums and the live notional gate
+        # are still enforced.
+        if reducing:
+            target_weight = existing_weight
+            decision.binding_constraint = "position_reduction"
+            if target_weight <= ZERO:
+                return decision.reject(
+                    "position is unvaluable at the current mark; cannot size a "
+                    "reduction"
+                )
+        else:
+            # --- candidate sizes ------------------------------------------
+            candidates: dict[str, Decimal] = {
+                "kelly": self.kelly_size(intent, scaled),
+                "vol_target": self.vol_target_size(intent, scaled),
+                "max_position_weight": scaled.max_position_weight,
+            }
+            candidates["risk_budget"] = (
+                candidates["max_position_weight"] * mandate.risk_budget_multiplier
             )
+
+            # Room left under the gross exposure ceiling.
+            current_gross = state.gross_exposure()
+            headroom = scaled.max_gross_exposure - current_gross
+            candidates["gross_exposure_headroom"] = max(ZERO, headroom)
+
+            # Room left in this specific name.
+            candidates["position_headroom"] = max(
+                ZERO, scaled.max_position_weight - existing_weight
+            )
+
+            binding = min(candidates, key=lambda k: candidates[k])
+            target_weight = candidates[binding]
+            decision.binding_constraint = binding
+
+            if target_weight <= ZERO:
+                return decision.reject(
+                    f"no room to add risk ({binding} is exhausted; "
+                    f"gross exposure {current_gross:.0%} of a "
+                    f"{scaled.max_gross_exposure:.0%} ceiling)"
+                )
 
         # --- weight -> quantity -------------------------------------------
         price = intent.quote.ask if intent.side is Side.BUY else intent.quote.bid
@@ -441,6 +481,17 @@ class RiskEngine:
 
         qty = target_notional_quote / price
         decision.requested_qty = qty
+
+        if reducing:
+            # A TradeIntent carries no quantity, so the only thing "reduce" can
+            # mean is "close". Size it from the held quantity directly instead of
+            # round-tripping weight -> notional -> price: the weight is measured
+            # at the mid and the fill is at the touch, and that half-spread of
+            # slack is enough to leave a dust position behind on every exit --
+            # which then sits there accruing risk nobody chose to hold.
+            qty = abs(held_qty)
+            decision.requested_qty = qty
+            decision.binding_constraint = "position_reduction"
 
         # --- cash constraint ---------------------------------------------
         if intent.side is Side.BUY:

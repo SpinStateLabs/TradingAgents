@@ -21,8 +21,12 @@ deliberate act that makes it real.
 from __future__ import annotations
 
 import argparse
+import importlib
+import logging
 import sys
+from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 
 from spintrader.core.config import (
     LiveTradingDisarmed, Settings, load_env_file,
@@ -262,6 +266,93 @@ def cmd_data_backfill(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def cmd_data_backfill_1m(args: argparse.Namespace) -> int:
+    """Backfill deep 1-minute history from Kraken's /Trades endpoint.
+
+    The OHLC endpoint reaches back only 720 bars and the WebSocket collector
+    only goes forward, so neither can recover deep minute history. This pages
+    /Trades forward from the requested start (or the last stored bar) toward the
+    present, aggregating trades into complete 1-minute bars. It is long running
+    -- 1000 trades is roughly an hour of history -- and resumable: re-running
+    continues from where it stopped. The forming final minute is never written;
+    the WebSocket collector owns the live edge.
+    """
+    from datetime import datetime, timezone
+
+    from spintrader.data.kraken_trades import backfill_1m
+    from spintrader.data.store import Store
+
+    settings = Settings.from_env()
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+
+    store = Store(settings.storage)
+    store.connect()
+    if args.migrate:
+        store.migrate()
+
+    venue = KrakenVenue(settings=settings)
+    venue.connect()
+
+    symbols = list(args.symbols) or list(settings.crypto_universe)
+
+    start: object
+    if args.since:
+        start = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc) \
+            if "T" not in args.since and "+" not in args.since \
+            else datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+    elif args.years is not None and not args.resume_only:
+        start = datetime.now(timezone.utc) - timedelta(days=int(365.25 * args.years))
+    else:
+        start = None    # resume from the last stored bar, else genesis
+    end = (datetime.fromisoformat(args.end.replace("Z", "+00:00"))
+           if args.end else None)
+
+    print("=" * 78)
+    print(f"{BOLD}1m trades backfill{RESET}  symbols={len(symbols)}  "
+          f"start={start if start is not None else 'resume/genesis'}  "
+          f"sleep={args.sleep}s")
+    print("=" * 78)
+
+    failures = 0
+    for symbol in symbols:
+        last_report = {"pages": 0}
+
+        def progress(info):
+            last_report.update(info)
+            print(f"  {symbol:<10} page {info['pages']:>5}  "
+                  f"written {info['written']:>8}  "
+                  f"at {info['cursor_ts']:%Y-%m-%d %H:%M}", end="\r", flush=True)
+
+        try:
+            result = backfill_1m(
+                store, venue, symbol,
+                start=start, end=end,
+                session=venue._session,
+                max_pages=args.max_pages,
+                sleep_s=args.sleep,
+                resume=not args.no_resume,
+                progress=progress,
+            )
+        except Exception as exc:                        # noqa: BLE001 - reported
+            print(f"\n  {symbol:<10}{RED}failed{RESET}: {str(exc)[:60]}")
+            failures += 1
+            continue
+
+        span = (f"{result['first']:%Y-%m-%d %H:%M} .. {result['last']:%Y-%m-%d %H:%M}"
+                if result.get("first") else "empty")
+        edge = f"  {GREEN}[live edge]{RESET}" if result.get("reached_live_edge") else \
+               (f"  {YELLOW}[end]{RESET}" if result.get("hit_end") else
+                f"  {YELLOW}[max-pages]{RESET}")
+        print(f"\n  {GREEN}{symbol}{RESET}: {result['pages']} pages, "
+              f"{result['written']} bars written, {result['bars']} total  "
+              f"{span}{edge}")
+
+    store.close()
+    print("=" * 78)
+    print(f"{'RESULT: PASS' if not failures else f'RESULT: {failures} failure(s)'}")
+    return 1 if failures else 0
+
+
 def cmd_data_collect(args: argparse.Namespace) -> int:
     """Run the WebSocket minute collector until interrupted.
 
@@ -313,6 +404,190 @@ def cmd_quote(args: argparse.Namespace) -> int:
 # entry point
 # --------------------------------------------------------------------------
 
+STRATEGIES = {
+    "baseline_trend": "spintrader.agents.personas.baseline_trend:BaselineTrendAgent",
+}
+
+
+def _load_strategy(name: str):
+    """Resolve a registered persona, or a ``module:Class`` path."""
+    target = STRATEGIES.get(name, name)
+    if ":" not in target:
+        raise SystemExit(
+            f"unknown strategy {name!r}; registered: "
+            f"{', '.join(sorted(STRATEGIES))}, or pass module:Class"
+        )
+    module_name, _, class_name = target.partition(":")
+    module = importlib.import_module(module_name)
+    try:
+        return getattr(module, class_name)
+    except AttributeError:
+        raise SystemExit(f"{module_name} has no attribute {class_name}") from None
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Replay a persona through the paper venue and score it."""
+    from spintrader.backtest.runner import (
+        backtest_instrument, export_run, format_report,
+        load_bars_from_csv, load_bars_from_store, run_backtest, write_bars_csv,
+    )
+    from spintrader.core.types import AssetClass
+
+    settings = Settings.from_env()
+    logging.basicConfig(level=settings.log_level)
+
+    asset_class = AssetClass(args.asset_class)
+    instrument = backtest_instrument(args.symbol, asset_class)
+
+    if args.csv:
+        bars = load_bars_from_csv(args.csv, instrument.key, args.interval)
+        source = args.csv
+    else:
+        # The store keys bars by the *ingesting* venue, not the paper venue the
+        # replay trades on, so the lookup key is built from the source venue.
+        source_venue = "kraken" if asset_class is AssetClass.CRYPTO else "ibkr"
+        store_key = f"{source_venue}:{args.symbol}"
+        try:
+            bars = load_bars_from_store(
+                store_key, args.interval, settings=settings,
+            )
+        except Exception as exc:                        # noqa: BLE001 - reported
+            print(f"could not read bars from the store: {exc}", file=sys.stderr)
+            print(
+                "pass --csv to run without the database "
+                "(see scripts/fetch_bars_csv.py)", file=sys.stderr,
+            )
+            return 1
+        source = store_key
+        # Re-key onto the paper venue so the replay's instrument matches.
+        bars = [replace(bar, instrument_key=instrument.key) for bar in bars]
+
+    if len(bars) < 2:
+        print(f"{source}: not enough bars ({len(bars)})", file=sys.stderr)
+        return 1
+
+    print(
+        f"{source}: {len(bars)} {args.interval} bars  "
+        f"{bars[0].ts:%Y-%m-%d} -> {bars[-1].ts:%Y-%m-%d}"
+    )
+
+    strategy_cls = _load_strategy(args.strategy)
+    run = run_backtest(
+        strategy_cls, args.symbol, bars,
+        asset_class=asset_class,
+        aggression=args.aggression or settings.aggression,
+        starting_cash=args.cash,
+        enforce_cash_account=not args.allow_margin,
+        n_trials=args.trials,
+        walk_forward=not args.no_walk_forward,
+        train_size=args.train_size,
+        test_size=args.test_size,
+        embargo=args.embargo,
+    )
+    print(format_report(run))
+
+    if args.out:
+        paths = export_run(run, args.out)
+        if not args.csv:
+            paths["bars"] = write_bars_csv(
+                bars, Path(args.out) / f"{args.symbol}_{args.interval}.csv"
+            )
+        for label, path in paths.items():
+            print(f"wrote {label}: {path}")
+
+    card = run.result.scorecard
+    if card is None:
+        return 1
+    # A non-zero exit on an insignificant result keeps a promotion script from
+    # shipping noise. Reported either way; only the exit code is opinionated.
+    return 0 if card.is_significant else 2
+
+
+def _build_mandate_service(settings: Settings, use_llm: bool):
+    """The slow loop's deliberation service: LLM panel or the quant bootstrap."""
+    from spintrader.agents.personas.roster import default_roster
+    from spintrader.loop.mandate import MandateService
+
+    if use_llm:
+        from spintrader.llm.router import LLMRouter
+        from spintrader.loop.voting import LLMVoter
+        voter = LLMVoter(LLMRouter(settings.llm))
+    else:
+        from spintrader.loop.voting import BootstrapVoter
+        voter = BootstrapVoter()
+    return MandateService(default_roster(), voter=voter)
+
+
+def cmd_loop_mandate(args: argparse.Namespace) -> int:
+    """Run one deliberation and print the mandate it would issue. No trading."""
+    from spintrader.loop.decision_loop import build_paper_loop
+
+    settings = Settings.from_env()
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    symbols = list(args.symbols) or list(settings.crypto_universe)
+
+    service = _build_mandate_service(settings, args.llm)
+    loop = build_paper_loop(symbols, settings=settings, mandate_service=service,
+                            with_regime=args.with_regime)
+    mandate = loop.refresh_mandate()
+    delib = loop.deliberation
+
+    print("=" * 74)
+    print(f"{BOLD}Deliberation{RESET}  ({'LLM panel' if args.llm else 'quant bootstrap'})")
+    print("=" * 74)
+    print(f"  {delib.summary()}")
+    print("-" * 74)
+    for key, verdict in sorted(delib.verdicts.items()):
+        permitted = key in mandate.permitted
+        flag = f"{GREEN}permitted{RESET}" if permitted else f"{DIM}not permitted{RESET}"
+        print(f"  {key:<18}{verdict.summary()}  [{flag}]")
+    print("=" * 74)
+    return 0
+
+
+def cmd_loop_run(args: argparse.Namespace) -> int:
+    """Run the two-tier decision loop in PAPER mode until interrupted.
+
+    Fast quant loop every minute; slow LLM (or bootstrap) loop hourly emitting
+    an expiring Mandate. This helper is paper-only by construction -- arming live
+    trading is the separate, deliberate act of flipping SPINTRADER_LIVE_ENABLED,
+    populating SPINTRADER_LIVE_VENUES and clearing READ_ONLY_API, which no code
+    path here performs.
+    """
+    from spintrader.loop.decision_loop import build_paper_loop
+
+    settings = Settings.from_env()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    symbols = list(args.symbols) or list(settings.crypto_universe)
+
+    service = _build_mandate_service(settings, args.llm)
+    loop = build_paper_loop(symbols, settings=settings, mandate_service=service,
+                            with_regime=args.with_regime)
+
+    print("=" * 74)
+    print(f"{BOLD}Decision loop{RESET}  mode=PAPER  symbols={', '.join(symbols)}")
+    print(f"  mandate source: {'LLM panel' if args.llm else 'quant bootstrap'}  "
+          f"regime={'on' if args.with_regime else 'off'}")
+    print(f"  fast {args.fast_interval}s / slow {args.slow_interval}s"
+          + (f" / max {args.max_ticks} ticks" if args.max_ticks else ""))
+    print("=" * 74)
+
+    try:
+        out = loop.run(
+            fast_interval_s=args.fast_interval,
+            slow_interval_s=args.slow_interval,
+            max_ticks=args.max_ticks,
+        )
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        return 0
+    print(f"stopped after {out['ticks']} ticks; {out['mandate']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="spintrader", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -353,6 +628,129 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("symbols", nargs="*", help="symbols (default: crypto universe)")
     collect.add_argument("--interval", type=int, default=1, help="bar interval in minutes")
     collect.set_defaults(func=cmd_data_collect)
+
+    backfill_1m = dsub.add_parser(
+        "backfill-1m",
+        help="backfill deep 1m history from Kraken /Trades (long running, resumable)",
+        description="Pages Kraken's public Trades endpoint forward and stores "
+                    "aggregated 1-minute bars. Unlike the OHLC endpoint (720 bars) "
+                    "and the WebSocket collector (forward only), this reaches back "
+                    "years. Resumable: re-run to continue from the last stored bar.",
+    )
+    backfill_1m.add_argument("symbols", nargs="*", help="symbols (default: crypto universe)")
+    backfill_1m.add_argument(
+        "--years", type=float, default=2.0,
+        help="how far back to start when there is nothing to resume from (default 2)",
+    )
+    backfill_1m.add_argument(
+        "--since", default=None,
+        help="explicit start date (YYYY-MM-DD or ISO-8601); overrides --years",
+    )
+    backfill_1m.add_argument(
+        "--end", default=None, help="stop at this date (YYYY-MM-DD or ISO-8601)",
+    )
+    backfill_1m.add_argument(
+        "--resume-only", action="store_true",
+        help="ignore --years; resume from the last stored bar, else genesis",
+    )
+    backfill_1m.add_argument(
+        "--no-resume", action="store_true",
+        help="do not resume from stored bars; use --since/--years as the start",
+    )
+    backfill_1m.add_argument("--max-pages", type=int, default=None, help="cap the page count")
+    backfill_1m.add_argument(
+        "--sleep", type=float, default=1.0, help="seconds between calls (rate limit)",
+    )
+    backfill_1m.add_argument("--migrate", action="store_true", help="apply the schema first")
+    backfill_1m.set_defaults(func=cmd_data_backfill_1m)
+
+    backtest = sub.add_parser(
+        "backtest",
+        help="replay a strategy through the paper venue and score it",
+        description="Replays historical bars through the same PaperVenue, "
+                    "RiskEngine and Ledger that paper and live trading use. "
+                    "Exit code 2 means the result is not statistically "
+                    "significant after the multiple-testing adjustment.",
+    )
+    backtest.add_argument("symbol", help="e.g. SPY or BTC-USD")
+    backtest.add_argument(
+        "--strategy", default="baseline_trend",
+        help=f"registered persona ({', '.join(sorted(STRATEGIES))}) "
+             f"or a module:Class path",
+    )
+    backtest.add_argument(
+        "--asset-class", default="equity", choices=["equity", "crypto", "etf"],
+        help="selects the cost model and the annualisation factor",
+    )
+    backtest.add_argument("--interval", default="1d", help="bar interval")
+    backtest.add_argument(
+        "--csv", default=None,
+        help="read bars from a CSV instead of the store "
+             "(see scripts/fetch_bars_csv.py)",
+    )
+    backtest.add_argument("--cash", default="1000", help="starting capital")
+    backtest.add_argument(
+        "--aggression", default=None,
+        choices=["conservative", "moderate", "balanced", "growth", "aggressive"],
+        help="risk profile (default: SPINTRADER_AGGRESSION)",
+    )
+    backtest.add_argument(
+        "--allow-margin", action="store_true",
+        help="disable cash-account rules (T+1 settlement and the short block)",
+    )
+    backtest.add_argument(
+        "--trials", type=int, default=1,
+        help="how many variants were tried to arrive at this one. Setting this "
+             "honestly is what keeps the deflated Sharpe meaningful; leaving it "
+             "at 1 after a parameter sweep is how a search gets reported as a "
+             "discovery.",
+    )
+    backtest.add_argument(
+        "--no-walk-forward", action="store_true", help="skip the fold analysis",
+    )
+    backtest.add_argument("--train-size", type=int, default=None)
+    backtest.add_argument("--test-size", type=int, default=None)
+    backtest.add_argument("--embargo", type=int, default=None)
+    backtest.add_argument(
+        "--out", default=None, help="directory for the equity curve and scorecard",
+    )
+    backtest.set_defaults(func=cmd_backtest)
+
+    loop = sub.add_parser(
+        "loop",
+        help="the two-tier decision loop (fast quant + slow LLM mandate)",
+    )
+    lsub = loop.add_subparsers(dest="loop_command", required=True)
+
+    loop_run = lsub.add_parser(
+        "run",
+        help="run the decision loop in PAPER mode (long running)",
+        description="Fast quant loop every minute under a slow, expiring mandate "
+                    "refreshed hourly. PAPER only; arming live trading is a "
+                    "separate deliberate act and no code path here performs it.",
+    )
+    loop_run.add_argument("symbols", nargs="*", help="symbols (default: crypto universe)")
+    loop_run.add_argument("--llm", action="store_true",
+                          help="use the LLM persona panel (default: quant bootstrap)")
+    loop_run.add_argument("--with-regime", action="store_true",
+                          help="fit the HMM regime model (needs hmmlearn)")
+    loop_run.add_argument("--fast-interval", type=float, default=60.0,
+                          help="seconds between fast ticks")
+    loop_run.add_argument("--slow-interval", type=float, default=3600.0,
+                          help="seconds between mandate refreshes")
+    loop_run.add_argument("--max-ticks", type=int, default=None,
+                          help="stop after this many fast ticks (default: run forever)")
+    loop_run.set_defaults(func=cmd_loop_run)
+
+    loop_mandate = lsub.add_parser(
+        "mandate", help="run one deliberation and print the mandate (no trading)",
+    )
+    loop_mandate.add_argument("symbols", nargs="*", help="symbols (default: crypto universe)")
+    loop_mandate.add_argument("--llm", action="store_true",
+                              help="use the LLM persona panel (default: quant bootstrap)")
+    loop_mandate.add_argument("--with-regime", action="store_true",
+                              help="fit the HMM regime model (needs hmmlearn)")
+    loop_mandate.set_defaults(func=cmd_loop_mandate)
 
     return parser
 

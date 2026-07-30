@@ -1,9 +1,9 @@
 # SpinTrader — build status and handoff
 
 Last updated: 2026-07-29. Branch `spintrader-foundation`, 11 commits ahead of
-the `upstream` fork point. **605 tests passing on the GB10**, 584 on Windows
-(the difference is `hmmlearn`, which has no Python 3.14 wheel for Windows — the
-HMM tests skip cleanly there).
+the `upstream` fork point (tasks 13 and 14 are uncommitted working-tree changes).
+**694 tests passing on Windows** (21 skipped — `hmmlearn` has no Python 3.14
+Windows wheel, so the HMM tests skip cleanly; the GB10 runs those too).
 
 Nothing is pushed to a remote. Nothing trades live.
 
@@ -66,28 +66,91 @@ All five passed as of the last session.
 | 10 | 17 investor personas + voting panel | `spintrader/agents/` |
 | 11 | Attribution, reliability, promotion gate | `spintrader/loop/` |
 | 12 | Live 1m WebSocket collector | `spintrader/data/kraken_ws.py` |
+| 13 | Deep 1m history from Kraken `/Trades` | `spintrader/data/kraken_trades.py` |
+| 14 | Two-tier decision loop (fast quant + slow LLM mandate) | `spintrader/loop/` |
 
 ---
 
 ## What remains
 
-Ordered by dependency. **Task 14 is the recommended next step** — it wires the
-existing pieces into something that actually runs.
+Ordered by dependency.
 
-- **14 — Two-tier decision loop.** Fast quant loop per minute (no LLM);
-  slow LLM loop hourly emitting a `Mandate`. The `Mandate` class already exists
-  in `spintrader/risk/engine.py` and expires by design.
 - **19 — Improvement-cycle orchestrator, agent factory, research memory.** The
   generative half of the loop; the scoring half is done. Every generated
   candidate **must** register with `TrialLedger` before evaluation, or the
   multiple-testing correction can be bypassed by not counting.
 - **15 — Maker-first execution.** 0.16% vs 0.26% is decisive at minute cadence.
-- **13 — 1m history from Kraken `/Trades`.** Reaches back years; the WS
-  collector only goes forward.
 - **16 — LLM recalibration agent** (daily). Guardrails already specified.
 - **17 — News/sentiment ingestion.** Adapt `tradingagents/dataflows/reddit.py`
   and `stocktwits.py` rather than rewriting.
-- **18 — Adaptive tier escalation.** `PanelVerdict.escalate` is already set.
+- **18 — Adaptive tier escalation.** `PanelVerdict.escalate` is already set; the
+  LLM voter records it but the deep-model re-adjudication is not yet wired (there
+  is a hook in `spintrader/loop/voting.py`).
+
+---
+
+## Tasks 13 & 14 — the running system
+
+### 13 — deep 1m history (`spintrader/data/kraken_trades.py`)
+
+Pages Kraken's public `/Trades` endpoint forward and aggregates trades into 1m
+bars, reaching back years — where the OHLC endpoint stops at 720 bars and the WS
+collector only goes forward. The one non-obvious rule: a minute is finalised
+only once a trade in a *later* minute is seen, so a minute split across a
+1000-trade page boundary yields **one** complete bar, not two partial ones (the
+held bucket carries across pages). The forming final minute is never written and
+is re-acquired on the next run. Resumable from the last stored bar.
+
+```bash
+python -m spintrader.cli data backfill-1m BTC-USD --years 2      # long, resumable
+python -m spintrader.cli data backfill-1m --since 2023-01-01 --end 2023-02-01
+```
+
+Verified end-to-end against the live endpoint: 2000 trades → 159 clean 1m bars,
+OHLC bounds and close-time alignment hold, forming minute dropped.
+
+### 14 — two-tier decision loop (`spintrader/loop/`)
+
+* `context.py` — the causal market snapshot both tiers share.
+* `voting.py` — the persona-vote layer the panel needed but lacked. `LLMVoter`
+  queries methodologies against the GB10 tiers (batched quick-then-deep, across
+  assets); `BootstrapVoter` derives one quant opinion under a single lens so the
+  panel correctly flags it low-conviction. Which one runs is a **runtime config**,
+  not a fork.
+* `mandate.py` — votes → panel verdict → `Mandate` (empty permits nothing;
+  regime risk is the portfolio max; HOLD/abstention does not permit).
+* `decision_loop.py` — the fast loop routes intents through the **same**
+  `RiskEngine`/`PaperVenue`/`Ledger` the backtester uses (`LiveCursor` mirrors
+  `ReplayCursor`); the slow loop refreshes the mandate.
+
+```bash
+python -m spintrader.cli loop mandate BTC-USD ETH-USD           # dry: print the mandate
+python -m spintrader.cli loop run BTC-USD --max-ticks 5         # paper, bootstrap
+python -m spintrader.cli loop run BTC-USD --llm --with-regime   # paper, LLM panel + HMM
+```
+
+Two decisions, made explicitly (confirmed with Don):
+
+1. **Exits are always reachable.** A reduce/close intent is evaluated against a
+   fresh close-only `Mandate`, so a held position can be exited even under an
+   expired or unpermitted real mandate (lessons L1). New risk still answers to
+   the real mandate. **The kill switch still halts everything, exits included**,
+   pending a human reset — that boundary is deliberate, not an oversight.
+2. **Slow loop = LLM panel with a quant bootstrap fallback**, injectable.
+
+`loop run` is **paper-only by construction** — it forces `TradingMode.PAPER` and
+never touches the three live switches. Arming live remains a human act.
+
+An adversarial review of this changeset caught the exit-reachability decision
+being *incomplete*: the close-only mandate bypassed mandate expiry/permission,
+but `min_confidence` and `max_trades_per_day` were still checked before the
+reduction branch in `RiskEngine.evaluate`, so a stop-loss was still trapped once
+the day hit its trade cap. That is now fixed at the engine: a reduction is
+identified up front and **skips every entry-only gate — confidence floor, daily
+trade cap, and directional bias** — pinned by
+`ExitReachabilityUnderEntryGatesTests`. The one remaining halt on an exit is the
+**kill switch**, which is deliberate (a tripped switch means stop and wait for a
+human) and is the sole exception.
 
 ---
 
