@@ -162,11 +162,14 @@ The scoring half (walk-forward backtester, `PromotionGate`, `TrialLedger`,
 reliability tracker) already refused almost everything. This is the generative
 half that feeds it, in `spintrader/research/` and `spintrader/loop/improvement.py`:
 
-* `research/factory.py` — the **agent factory** (v1): enumerates
-  `BaselineTrendAgent` parameter configurations from a bounded grid, in a fixed
-  order, filtering combinations the agent would reject. Each config has a stable
-  content hash. (Generating genuinely new *personas* is the next extension; the
-  interface won't change.)
+* `research/factory.py` — the **agent factory**: enumerates configurations of
+  strategy *families* (a strategy class + base config + grid), in a fixed order,
+  filtering combinations a family would reject. Each config has a stable content
+  hash over family + params. Two families ship, forecasting expected return in
+  opposite ways: `BaselineTrendAgent` (buy strength) and `MeanReversionAgent`
+  (buy weakness) -- so the search attacks the *edge*, not just the trend rule's
+  parameters. The improvement cycle re-backtests a champion with its own family's
+  class. New families drop in behind the same interface.
 * `research/memory.py` — the **research memory**: records every candidate
   evaluated per objective (promoted or rejected, and why), so a round never
   re-tests — or re-counts — a configuration. Optionally persisted via the

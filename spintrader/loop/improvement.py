@@ -87,6 +87,8 @@ class ImprovementCycle:
         self.factory = factory or CandidateFactory()
         self.strategy_cls = strategy_cls
         self.backtest_fn = backtest_fn
+        # Resolve a champion's family back to its strategy class when re-backtesting.
+        self._family_cls = self.factory.family_classes()
 
     def run_round(
         self,
@@ -110,8 +112,9 @@ class ImprovementCycle:
         incumbent_card = None
         incumbent_key = None
         if champion is not None:
+            champion_cls = self._family_cls.get(champion.family, self.strategy_cls)
             inc_run = self._backtest(champion.config, symbol, bars, asset_class,
-                                     aggression, starting_cash)
+                                     aggression, starting_cash, champion_cls)
             incumbent_card = self._card(inc_run)
             incumbent_key = champion.config_key
 
@@ -127,7 +130,7 @@ class ImprovementCycle:
 
         for cfg in candidates:
             run = self._backtest(cfg.to_dict(), symbol, bars, asset_class,
-                                 aggression, starting_cash)
+                                 aggression, starting_cash, cfg.strategy_cls)
             wf = getattr(run, "walk_forward", None)
             if wf is None or wf.combined is None:
                 # Cannot evaluate (too few bars for a fold split). Record it as
@@ -135,7 +138,7 @@ class ImprovementCycle:
                 # run the gate -- an aborted test is not a trial.
                 self.memory.record(TrialRecord(
                     objective=objective, config_key=cfg.key, config=cfg.to_dict(),
-                    promoted=False, deflated_sharpe=0.0, n_trials=0,
+                    promoted=False, deflated_sharpe=0.0, n_trials=0, family=cfg.family,
                     rejections=[Rejection.INSUFFICIENT_DATA.value],
                     note="no walk-forward result (too few bars)",
                 ))
@@ -151,7 +154,7 @@ class ImprovementCycle:
             self.memory.record(TrialRecord(
                 objective=objective, config_key=cfg.key, config=cfg.to_dict(),
                 promoted=verdict.promoted, deflated_sharpe=verdict.deflated_sharpe,
-                n_trials=verdict.n_trials,
+                n_trials=verdict.n_trials, family=cfg.family,
                 sharpe=card.sharpe, total_return=card.total_return,
                 max_drawdown=card.max_drawdown,
                 rejections=[r.value for r in verdict.rejections],
@@ -175,9 +178,10 @@ class ImprovementCycle:
 
     # -- helpers -----------------------------------------------------------
 
-    def _backtest(self, config, symbol, bars, asset_class, aggression, cash):
+    def _backtest(self, config, symbol, bars, asset_class, aggression, cash,
+                  strategy_cls=None):
         return self.backtest_fn(
-            self.strategy_cls, symbol, bars,
+            strategy_cls or self.strategy_cls, symbol, bars,
             asset_class=asset_class, aggression=aggression,
             starting_cash=cash, walk_forward=True, n_trials=1,
             strategy_kwargs=dict(config),

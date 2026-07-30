@@ -41,6 +41,7 @@ class TrialRecord:
     promoted: bool
     deflated_sharpe: float
     n_trials: int
+    family: str = "trend"
     sharpe: float | None = None
     total_return: float | None = None
     max_drawdown: float | None = None
@@ -56,6 +57,7 @@ class TrialRecord:
             "promoted": self.promoted,
             "deflated_sharpe": self.deflated_sharpe,
             "n_trials": self.n_trials,
+            "family": self.family,
             "sharpe": self.sharpe,
             "total_return": self.total_return,
             "max_drawdown": self.max_drawdown,
@@ -73,6 +75,7 @@ class TrialRecord:
             config=dict(d.get("config", {})), promoted=bool(d["promoted"]),
             deflated_sharpe=float(d.get("deflated_sharpe", 0.0)),
             n_trials=int(d.get("n_trials", 1)),
+            family=d.get("family", "trend"),
             sharpe=d.get("sharpe"), total_return=d.get("total_return"),
             max_drawdown=d.get("max_drawdown"),
             rejections=list(d.get("rejections", [])), note=d.get("note", ""),

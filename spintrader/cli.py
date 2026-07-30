@@ -406,6 +406,7 @@ def cmd_quote(args: argparse.Namespace) -> int:
 
 STRATEGIES = {
     "baseline_trend": "spintrader.agents.personas.baseline_trend:BaselineTrendAgent",
+    "mean_reversion": "spintrader.agents.personas.mean_reversion:MeanReversionAgent",
 }
 
 
@@ -607,7 +608,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
     from spintrader.core.types import AssetClass
     from spintrader.loop.improvement import ImprovementCycle
     from spintrader.loop.promotion import PromotionGate, TrialLedger
-    from spintrader.research.factory import CandidateFactory
+    from spintrader.research.factory import CandidateFactory, default_families
     from spintrader.research.memory import ResearchMemory
 
     settings = Settings.from_env()
@@ -642,7 +643,8 @@ def cmd_improve(args: argparse.Namespace) -> int:
     gate = PromotionGate(ledger=TrialLedger())
     memory = ResearchMemory(store=store)
     loaded = memory.load(objective)
-    cycle = ImprovementCycle(gate=gate, memory=memory, factory=CandidateFactory())
+    factory = CandidateFactory(families=default_families())    # trend + mean reversion
+    cycle = ImprovementCycle(gate=gate, memory=memory, factory=factory)
 
     print("=" * 74)
     print(f"{BOLD}Improvement round{RESET}  objective '{objective}'  "

@@ -302,6 +302,78 @@ class ImprovementCycleTests(unittest.TestCase):
                             for v in r2.verdicts))
 
 
+def family_fake(mr_sharpe=3.0, trend_sharpe=0.2):
+    """Fake backtester keyed on family: mean-reversion configs carry 'lookback'."""
+    def fn(strategy_cls, symbol, bars, *, asset_class, aggression,
+           starting_cash, walk_forward, n_trials, strategy_kwargs):
+        s = mr_sharpe if "lookback" in strategy_kwargs else trend_sharpe
+        card = FakeCard(sharpe=s)
+        wf = FakeWF(combined=card, n_folds=4, folds=[FakeFold(FakeCard(sharpe=s))] * 4)
+        return FakeRun(walk_forward=wf, result=FakeResult(card))
+    return fn
+
+
+def two_small_families():
+    from spintrader.research.factory import mean_reversion_family, trend_family
+    tf = trend_family()
+    tf.grid = {"trail_pct": ("0.05", "0.08")}
+    mf = mean_reversion_family()
+    mf.grid = {"entry_z": ("1.0", "1.5")}
+    return [tf, mf]
+
+
+class MultiFamilyTests(unittest.TestCase):
+    def test_default_families_span_trend_and_mean_reversion(self):
+        from spintrader.research.factory import default_families
+        families = {c.family for c in CandidateFactory(families=default_families()).all_configs()}
+        self.assertEqual(families, {"trend", "mean_reversion"})
+
+    def test_configs_carry_their_own_strategy_class(self):
+        from spintrader.agents.personas.baseline_trend import BaselineTrendAgent
+        from spintrader.agents.personas.mean_reversion import MeanReversionAgent
+        from spintrader.research.factory import default_families
+        by_family = {c.family: c.strategy_cls
+                     for c in CandidateFactory(families=default_families()).all_configs()}
+        self.assertIs(by_family["trend"], BaselineTrendAgent)
+        self.assertIs(by_family["mean_reversion"], MeanReversionAgent)
+
+    def test_keys_are_unique_across_families(self):
+        from spintrader.research.factory import default_families
+        keys = [c.key for c in CandidateFactory(families=default_families()).all_configs()]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_improve_searches_and_promotes_across_families(self):
+        factory = CandidateFactory(families=two_small_families())
+        gate = PromotionGate(ledger=TrialLedger())
+        memory = ResearchMemory()
+        cycle = ImprovementCycle(gate=gate, memory=memory, factory=factory,
+                                 backtest_fn=family_fake(mr_sharpe=3.0, trend_sharpe=0.2))
+        result = cycle.run_round("x", "BTC-USD", [None] * 10)
+        # Both families were evaluated and each counted as a trial.
+        self.assertEqual(result.evaluated, len(factory.all_configs()))
+        self.assertEqual(gate.ledger.trials("x"), result.evaluated)
+        # The winning family is mean reversion (the one given the real edge here).
+        self.assertTrue(result.promoted)
+        self.assertEqual(memory.best("x").family, "mean_reversion")
+
+    def test_champion_of_either_family_is_rebacktested_correctly(self):
+        # After a mean-reversion champion, the cycle must resolve its family back
+        # to the MeanReversionAgent to re-backtest it as the incumbent.
+        from spintrader.agents.personas.mean_reversion import MeanReversionAgent
+        factory = CandidateFactory(families=two_small_families())
+        gate = PromotionGate(ledger=TrialLedger())
+        memory = ResearchMemory()
+        cycle = ImprovementCycle(gate=gate, memory=memory, factory=factory,
+                                 backtest_fn=family_fake(mr_sharpe=3.0, trend_sharpe=0.2))
+        cycle.run_round("x", "BTC-USD", [None] * 10)
+        champ = memory.best("x")
+        self.assertEqual(champ.family, "mean_reversion")
+        self.assertIs(cycle._family_cls[champ.family], MeanReversionAgent)
+        # A second round re-backtests the champion (no error) and re-counts nothing.
+        second = cycle.run_round("x", "BTC-USD", [None] * 10)
+        self.assertEqual(second.evaluated, 0)
+
+
 class BacktestAnnualisationTests(unittest.TestCase):
     """The scorecard must annualise by the bar interval, not a daily default.
 

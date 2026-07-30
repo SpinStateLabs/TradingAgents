@@ -8,11 +8,13 @@ The orchestrator that drives them against the scoring half lives in
 """
 
 from spintrader.research.factory import (
-    BASE_CONFIG, DEFAULT_GRID, CandidateConfig, CandidateFactory,
+    BASE_CONFIG, DEFAULT_GRID, CandidateConfig, CandidateFactory, StrategyFamily,
+    default_families, mean_reversion_family, trend_family,
 )
 from spintrader.research.memory import ResearchMemory, TrialRecord
 
 __all__ = [
     "BASE_CONFIG", "DEFAULT_GRID", "CandidateConfig", "CandidateFactory",
-    "ResearchMemory", "TrialRecord",
+    "ResearchMemory", "StrategyFamily", "TrialRecord", "default_families",
+    "mean_reversion_family", "trend_family",
 ]
