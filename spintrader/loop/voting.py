@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Mapping, Protocol, Sequence
+from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 from spintrader.agents.panel import PersonaVote, abstain
 from spintrader.agents.personas.spec import Lens, PersonaSpec
@@ -66,6 +66,26 @@ class Voter(Protocol):
 
     def vote_all(self, items: Sequence[VoteItem]) -> dict[str, list[PersonaVote]]:
         """Return votes grouped by instrument key."""
+        ...
+
+
+@runtime_checkable
+class Adjudicator(Protocol):
+    """A voter that can re-adjudicate contested instruments on the deep tier.
+
+    Adaptive escalation (task 18) only fires for voters that implement this.
+    The bootstrap voter has no deep model, so it is deliberately *not* an
+    ``Adjudicator``; :class:`~spintrader.loop.mandate.MandateService` checks for
+    this capability and degrades escalation to a graceful no-op when it is
+    absent. Being a runtime-checkable Protocol, ``isinstance(voter, Adjudicator)``
+    is a structural check for the ``adjudicate_all`` method, so a test fake needs
+    only to define it.
+    """
+
+    def adjudicate_all(
+        self, items: Sequence[VoteItem]
+    ) -> dict[str, list[PersonaVote]]:
+        """Re-vote the given (persona, instrument) questions on the deep tier."""
         ...
 
 
@@ -141,6 +161,24 @@ VOTE_SCHEMA: dict = {
 }
 
 
+# Appended to a persona's own system prompt on the deep re-adjudication pass.
+# The methodology is unchanged -- the persona still reasons as itself -- but the
+# deep model is told the decision was contested on the first pass and asked to
+# weigh the strongest opposing evidence before committing. This is the "sharper
+# adjudication instruction" of task 18.
+DEEP_ADJUDICATION_DIRECTIVE = (
+    "\n\n--- Deep re-adjudication ---\n"
+    "This decision was contested on the first pass: the panel was split, or too "
+    "few independent methods spoke to it. Re-examine it with more care than a "
+    "routine call warrants. Identify the single strongest piece of evidence "
+    "against your view and weigh it honestly before you commit; state it as "
+    "changed_by. Commit to the direction your own methodology genuinely "
+    "supports -- do not split the difference to appear balanced -- and abstain "
+    "only if the evidence you require is truly absent, not merely because the "
+    "decision is hard."
+)
+
+
 def _vote_prompt(item: VoteItem) -> str:
     ctx = item.context
     return (
@@ -158,40 +196,79 @@ def _vote_prompt(item: VoteItem) -> str:
 class LLMVoter:
     """Queries persona methodologies against the GB10 model tiers.
 
-    One :meth:`vote_all` call issues one batched request set. Every persona is
-    asked on the quick tier by default; the panel decides afterwards whether the
-    verdict is contentious enough to escalate to the deep model (that adaptive
-    step is task 18 and is left as a hook rather than run here).
+    One :meth:`vote_all` call issues one batched request set on the quick tier.
+    The panel decides afterwards whether a verdict is contentious enough to
+    escalate; when it is, :class:`~spintrader.loop.mandate.MandateService` calls
+    :meth:`adjudicate_all` to re-run just those instruments on the deep model.
+    That is the adaptive escalation of task 18: this voter is the
+    :class:`Adjudicator`, and the two passes are always separate batches, so the
+    99 GB deep model pages in at most once per cycle and is never interleaved
+    with quick calls.
     """
 
     def __init__(
         self,
         router: LLMRouter,
         tier: Tier = Tier.QUICK,
+        deep_tier: Tier = Tier.DEEP,
         temperature: float | None = None,
         max_tokens: int = 400,
+        adjudication_directive: str | None = None,
     ) -> None:
         self.router = router
         self.tier = tier
+        self.deep_tier = deep_tier
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.adjudication_directive = (
+            DEEP_ADJUDICATION_DIRECTIVE if adjudication_directive is None
+            else adjudication_directive
+        )
 
     def vote_all(self, items: Sequence[VoteItem]) -> dict[str, list[PersonaVote]]:
+        """First-pass votes on the quick tier."""
+        return self._vote_batch(items, self.tier)
+
+    def adjudicate_all(
+        self, items: Sequence[VoteItem]
+    ) -> dict[str, list[PersonaVote]]:
+        """Deep-tier re-adjudication of contested instruments (task 18).
+
+        Reuses each persona's own methodology prompt, but routed to the deep
+        model and extended with :data:`DEEP_ADJUDICATION_DIRECTIVE`. Runs as a
+        single batched deep pass across every persona of every escalated
+        instrument, so the deep model loads once for the whole escalation set.
+        """
+        return self._vote_batch(
+            items, self.deep_tier, system_suffix=self.adjudication_directive,
+        )
+
+    def _vote_batch(
+        self,
+        items: Sequence[VoteItem],
+        tier: Tier,
+        system_suffix: str | None = None,
+    ) -> dict[str, list[PersonaVote]]:
         out: dict[str, list[PersonaVote]] = {item.instrument_key: [] for item in items}
         if not items:
             return out
 
-        requests = [{
-            "prompt": _vote_prompt(item),
-            "system": item.spec.system_prompt(),
-            "json_schema": VOTE_SCHEMA,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "think": False,        # schema + reasoning interact badly; see router
-        } for item in items]
+        requests = []
+        for item in items:
+            system = item.spec.system_prompt()
+            if system_suffix:
+                system += system_suffix
+            requests.append({
+                "prompt": _vote_prompt(item),
+                "system": system,
+                "json_schema": VOTE_SCHEMA,
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "think": False,    # schema + reasoning interact badly; see router
+            })
 
-        results = self.router.run_batched({self.tier: requests})
-        responses = results.get(self.tier, [])
+        results = self.router.run_batched({tier: requests})
+        responses = results.get(tier, [])
 
         for item, response in zip(items, responses):
             out[item.instrument_key].append(self._to_vote(item, response))
@@ -228,5 +305,6 @@ class LLMVoter:
 
 
 __all__ = [
-    "BootstrapVoter", "LLMVoter", "VOTE_SCHEMA", "VoteItem", "Voter",
+    "Adjudicator", "BootstrapVoter", "DEEP_ADJUDICATION_DIRECTIVE", "LLMVoter",
+    "VOTE_SCHEMA", "VoteItem", "Voter",
 ]

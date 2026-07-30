@@ -30,11 +30,11 @@ from decimal import Decimal
 from typing import Mapping, Sequence
 
 from spintrader.agents.panel import PanelVerdict, PersonaPanel
-from spintrader.agents.personas.spec import Horizon, PersonaRegistry
+from spintrader.agents.personas.spec import Horizon, PersonaRegistry, PersonaSpec
 from spintrader.core.types import Action, utcnow
 from spintrader.risk.engine import Mandate
 from spintrader.loop.context import MarketContext
-from spintrader.loop.voting import BootstrapVoter, VoteItem, Voter
+from spintrader.loop.voting import Adjudicator, BootstrapVoter, VoteItem, Voter
 
 log = logging.getLogger(__name__)
 
@@ -112,12 +112,17 @@ class Deliberation:
     mandate: Mandate
     verdicts: dict[str, PanelVerdict] = field(default_factory=dict)
     contexts: dict[str, MarketContext] = field(default_factory=dict)
+    #: Instrument keys whose contested first-pass verdict was re-adjudicated on
+    #: the deep model this cycle (task 18). Empty when nothing escalated or the
+    #: voter has no deep tier.
+    escalated: frozenset[str] = field(default_factory=frozenset)
 
     def summary(self) -> str:
         permits = ", ".join(sorted(self.mandate.permitted)) or "nothing"
+        escalated = f", escalated {len(self.escalated)}" if self.escalated else ""
         return (
             f"mandate permits {permits}; regime_risk {self.mandate.regime_risk:.2f}, "
-            f"budget x{self.mandate.risk_budget_multiplier:.2f}, "
+            f"budget x{self.mandate.risk_budget_multiplier:.2f}{escalated}, "
             f"expires {self.mandate.expires_at:%Y-%m-%d %H:%M}"
         )
 
@@ -132,6 +137,7 @@ class MandateService:
         voter: Voter | None = None,
         ttl: timedelta = timedelta(minutes=90),
         min_reliability: Decimal = ZERO,
+        escalate: bool = True,
     ) -> None:
         self.registry = registry
         self.panel = panel or PersonaPanel(registry)
@@ -140,6 +146,10 @@ class MandateService:
         self.voter = voter or BootstrapVoter()
         self.ttl = ttl
         self.min_reliability = min_reliability
+        # Whether a contested first-pass verdict is re-adjudicated on the deep
+        # model. The dispersion / lens-diversity thresholds that decide *what*
+        # counts as contested live on the panel; this only toggles the pass.
+        self.escalate = escalate
 
     def deliberate(
         self,
@@ -150,12 +160,16 @@ class MandateService:
         now = now or utcnow()
 
         # Build one flat work list across all instruments, so the LLM voter can
-        # batch every persona call in a single tier-grouped pass.
+        # batch every persona call in a single tier-grouped pass. Keep each
+        # instrument's applicable specs so the escalation pass can reuse them
+        # without re-querying the registry.
+        specs_by_key: dict[str, list[PersonaSpec]] = {}
         items: list[VoteItem] = []
         for key, ctx in contexts.items():
             specs = self.registry.applicable(
                 ctx.asset_class, ctx.horizon, min_reliability=self.min_reliability,
             )
+            specs_by_key[key] = specs
             items.extend(VoteItem(spec=spec, context=ctx) for spec in specs)
 
         votes_by_key = self.voter.vote_all(items)
@@ -169,12 +183,71 @@ class MandateService:
             verdicts[key] = verdict
             regime_risk[key] = ctx.regime_risk
 
+        # Adaptive tier escalation (task 18): re-adjudicate any contested verdict
+        # on the deep model and replace it in place. Mutates `verdicts`.
+        escalated = self._escalate(contexts, specs_by_key, verdicts)
+
         mandate = build_mandate(verdicts, regime_risk, ttl=self.ttl, now=now)
         deliberation = Deliberation(
             mandate=mandate, verdicts=verdicts, contexts=dict(contexts),
+            escalated=frozenset(escalated),
         )
         log.info("slow loop: %s", deliberation.summary())
         return deliberation
+
+    def _escalate(
+        self,
+        contexts: Mapping[str, MarketContext],
+        specs_by_key: Mapping[str, Sequence[PersonaSpec]],
+        verdicts: dict[str, PanelVerdict],
+    ) -> set[str]:
+        """Re-adjudicate contested first-pass verdicts on the deep tier.
+
+        Collects every instrument whose quick verdict set ``escalate`` (a split
+        panel or a single lens), runs ONE batched deep pass over just those --
+        all deep calls in a single ``adjudicate_all`` batch, never interleaved
+        with the quick pass -- and replaces those instruments' verdicts with the
+        ones re-aggregated from the deep votes.
+
+        A graceful no-op when escalation is disabled, when the voter has no deep
+        tier (the bootstrap voter is not an :class:`Adjudicator`), or when
+        nothing escalated. Returns the keys that were actually re-adjudicated.
+        """
+        if not self.escalate:
+            return set()
+        # Only a voter that can reach the deep model adjudicates. The bootstrap
+        # voter cannot, so escalation degrades to a no-op rather than breaking.
+        if not isinstance(self.voter, Adjudicator):
+            return set()
+
+        escalated_keys = [key for key, verdict in verdicts.items() if verdict.escalate]
+        if not escalated_keys:
+            return set()
+
+        # One flat deep work list across ALL escalated instruments, so the deep
+        # model pages in exactly once for the whole escalation set.
+        deep_items: list[VoteItem] = []
+        for key in escalated_keys:
+            ctx = contexts[key]
+            deep_items.extend(
+                VoteItem(spec=spec, context=ctx) for spec in specs_by_key[key]
+            )
+
+        deep_votes_by_key = self.voter.adjudicate_all(deep_items)
+
+        re_adjudicated: set[str] = set()
+        for key in escalated_keys:
+            deep_votes = deep_votes_by_key.get(key, [])
+            if not deep_votes:
+                # The deep pass returned nothing for this instrument; keep the
+                # quick verdict rather than blanking it.
+                continue
+            ctx = contexts[key]
+            verdicts[key] = self.panel.aggregate(
+                deep_votes, ctx.asset_class, ctx.horizon,
+            )
+            re_adjudicated.add(key)
+        return re_adjudicated
 
 
 __all__ = [
