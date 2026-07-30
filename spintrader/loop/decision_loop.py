@@ -36,13 +36,14 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from enum import Enum
 from typing import Callable, Mapping, Sequence
 
 from spintrader.agents.personas.spec import Horizon
 from spintrader.core.config import Settings, get_settings
 from spintrader.core.types import (
     Action, Bar, Decision, Instrument, Order, OrderType, Quote, Side,
-    TradingMode, to_decimal, utcnow,
+    TimeInForce, TradingMode, to_decimal, utcnow,
 )
 from spintrader.loop.context import gather_contexts
 from spintrader.loop.mandate import Deliberation, MandateService
@@ -54,6 +55,23 @@ from spintrader.venues.paper import PaperVenue, SlippageModel
 log = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
+
+
+class ExecutionStyle(str, Enum):
+    """How the loop turns an approved intent into an order.
+
+    ``TAKER`` sends a market order: immediate, certain, pays the taker fee.
+    ``MAKER_FIRST`` posts a passive limit at the touch to earn the maker fee
+    (0.16% vs 0.26% on Kraken -- decisive at minute cadence), and escalates to a
+    taker market order if it has not filled within ``maker_timeout_ticks``.
+
+    Two deliberate rules: exits are ALWAYS taker regardless of style -- a
+    stop-loss that waits in the queue while the loss grows is the wrong trade --
+    and backtests stay taker, so a strategy is promoted against the harder cost
+    and live maker fills are a bonus, never a dependency.
+    """
+    TAKER = "taker"
+    MAKER_FIRST = "maker_first"
 
 
 # --------------------------------------------------------------------------
@@ -168,6 +186,8 @@ class DecisionLoop:
         with_regime: bool = False,
         quote_provider: Callable[[Instrument, Bar], Quote] | None = None,
         data_keys: Mapping[str, str] | None = None,
+        execution: ExecutionStyle = ExecutionStyle.TAKER,
+        maker_timeout_ticks: int = 3,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -189,9 +209,16 @@ class DecisionLoop:
         self.continuous = continuous
         self.with_regime = with_regime
         self._quote_provider = quote_provider
+        self.execution = execution
+        self.maker_timeout_ticks = maker_timeout_ticks
         self._current_quotes: dict[str, Quote] = {}
         self._deliberation: Deliberation | None = None
         self._running = False
+        self._tick = 0
+        # instrument key -> the resting maker order working for it, and the tick
+        # it was posted on, so a stale one can be escalated to a taker fill.
+        self._working: dict[str, Order] = {}
+        self._posted_tick: dict[str, int] = {}
 
     # -- market data helpers ----------------------------------------------
 
@@ -230,6 +257,7 @@ class DecisionLoop:
     ) -> list[ExecutionResult]:
         """One minute-cadence pass over the universe."""
         now = now or utcnow()
+        self._tick += 1
 
         # 1. Refresh every quote first, so the book can be fully valued before
         #    any single trade is sized. to_risk_state refuses a partial view, so
@@ -253,10 +281,16 @@ class DecisionLoop:
                 marks[instrument.key] = quote.mid
 
         # Advance the (paper) venue clock and settle matured cash, then mark.
+        # set_time fills any resting maker limits the market traded through, so
+        # sync those into the ledger and retire filled/stale working orders
+        # before sizing anything new.
         if isinstance(self.venue, PaperVenue):
             self.venue.set_time(now)
         self.ledger.settle(now)
         self.ledger.mark(marks)
+        self._sync_fills(now)
+        self._reconcile_working(now)
+        self._sync_fills(now)
 
         # 2. Ask each strategy for intents and route them.
         results: list[ExecutionResult] = []
@@ -359,15 +393,26 @@ class DecisionLoop:
             self._persist(decision)
             return result
 
-        order = Order(
-            instrument=intent.instrument,
-            side=intent.side,
-            qty=risk_decision.qty,
-            order_type=OrderType.MARKET,
-            mode=self.settings.mode,
-            strategy=intent.strategy,
-            decision_id=decision.decision_id,
-        )
+        # Maker-first posts a passive limit at the touch for ENTRIES only; exits
+        # are always taker (a stop-loss must not wait in the queue). A new intent
+        # supersedes any order still working for this instrument.
+        maker = self.execution is ExecutionStyle.MAKER_FIRST and not reducing
+        self._cancel_working(key, now)
+        if maker:
+            touch = intent.quote.bid if intent.side is Side.BUY else intent.quote.ask
+            order = Order(
+                instrument=intent.instrument, side=intent.side, qty=risk_decision.qty,
+                order_type=OrderType.LIMIT, limit_price=touch,
+                time_in_force=TimeInForce.GTC, mode=self.settings.mode,
+                strategy=f"{intent.strategy}:maker", decision_id=decision.decision_id,
+            )
+        else:
+            order = Order(
+                instrument=intent.instrument, side=intent.side, qty=risk_decision.qty,
+                order_type=OrderType.MARKET, mode=self.settings.mode,
+                strategy=intent.strategy, decision_id=decision.decision_id,
+            )
+
         try:
             self.venue.submit(order)
             result.submitted = True
@@ -378,16 +423,63 @@ class DecisionLoop:
             self._persist(decision)
             return result
 
-        # Fold fills into the ledger exactly as live does. apply_fill is
-        # idempotent, so re-scanning the venue's fill list is safe.
-        applied = ZERO
-        for fill in self._venue_fills():
-            if self.ledger.apply_fill(fill, now=now):
-                if fill.order_id == order.order_id:
-                    applied += fill.qty
-        result.filled_qty = applied
+        # A maker limit that did not fill immediately rests in the book; track it
+        # so it can be escalated to taker if it stays unfilled.
+        if maker and not order.is_terminal:
+            self._working[key] = order
+            self._posted_tick[key] = self._tick
+
+        # Fold fills into the ledger. apply_fill is idempotent, so re-scanning the
+        # venue's fill list is safe; the order object carries its own fill total.
+        self._sync_fills(now)
+        result.filled_qty = order.filled_qty
         self._persist(decision)
         return result
+
+    # -- order lifecycle ---------------------------------------------------
+
+    def _sync_fills(self, now: datetime) -> None:
+        """Fold every venue fill into the ledger (idempotent, dedup by fill id).
+
+        Called after the venue clock advances (which fills resting maker limits)
+        and after each submit, so the book stays current within a tick regardless
+        of whether a fill was immediate or came from a rested order.
+        """
+        for fill in self._venue_fills():
+            self.ledger.apply_fill(fill, now=now)
+
+    def _reconcile_working(self, now: datetime) -> None:
+        """Retire filled maker orders; escalate stale ones to a taker fill."""
+        for key, order in list(self._working.items()):
+            if order.is_terminal:
+                self._working.pop(key, None)
+                self._posted_tick.pop(key, None)
+                continue
+            age = self._tick - self._posted_tick.get(key, self._tick)
+            if age >= self.maker_timeout_ticks:
+                remaining = order.remaining_qty
+                self._cancel_working(key, now)
+                if remaining > ZERO:
+                    taker = Order(
+                        instrument=order.instrument, side=order.side, qty=remaining,
+                        order_type=OrderType.MARKET, mode=self.settings.mode,
+                        strategy=f"{order.strategy}:taker_escalation",
+                        decision_id=order.decision_id,
+                    )
+                    try:
+                        self.venue.submit(taker)
+                        self._sync_fills(now)
+                    except Exception as exc:            # noqa: BLE001 - recorded
+                        log.warning("taker escalation for %s failed: %s", key, exc)
+
+    def _cancel_working(self, key: str, now: datetime) -> None:
+        order = self._working.pop(key, None)
+        self._posted_tick.pop(key, None)
+        if order is not None and not order.is_terminal:
+            try:
+                self.venue.cancel(order)
+            except Exception as exc:                    # noqa: BLE001 - non-fatal
+                log.debug("cancel working order for %s failed: %s", key, exc)
 
     def _venue_fills(self):
         # PaperVenue exposes .fills; a live venue reports fills through its own
@@ -484,6 +576,8 @@ def build_paper_loop(
     interval: str = "1m",
     with_regime: bool = False,
     slippage: SlippageModel | None = None,
+    execution: ExecutionStyle = ExecutionStyle.TAKER,
+    maker_timeout_ticks: int = 3,
 ) -> DecisionLoop:
     """Wire a paper-mode loop over Kraken crypto symbols.
 
@@ -574,6 +668,7 @@ def build_paper_loop(
         strategies=strategies, mandate_service=mandate_service,
         instruments=instruments, interval=interval, spread_bps=costs.spread_bps,
         with_regime=with_regime, horizon=Horizon.INTRADAY, data_keys=data_keys,
+        execution=execution, maker_timeout_ticks=maker_timeout_ticks,
     )
     loop_holder["loop"] = loop
     return loop

@@ -70,6 +70,7 @@ All five passed as of the last session.
 | 12 | Live 1m WebSocket collector | `spintrader/data/kraken_ws.py` |
 | 13 | Deep 1m history from Kraken `/Trades` | `spintrader/data/kraken_trades.py` |
 | 14 | Two-tier decision loop (fast quant + slow LLM mandate) | `spintrader/loop/` |
+| 15 | Maker-first execution + maker/taker fee accounting | `spintrader/loop/decision_loop.py`, `spintrader/venues/paper.py` |
 | 19 | Improvement cycle: candidate factory, research memory, orchestrator | `spintrader/research/`, `spintrader/loop/improvement.py` |
 
 ---
@@ -78,7 +79,6 @@ All five passed as of the last session.
 
 Ordered by dependency.
 
-- **15 — Maker-first execution.** 0.16% vs 0.26% is decisive at minute cadence.
 - **16 — LLM recalibration agent** (daily). Guardrails already specified.
 - **17 — News/sentiment ingestion.** Adapt `tradingagents/dataflows/reddit.py`
   and `stocktwits.py` rather than rewriting.

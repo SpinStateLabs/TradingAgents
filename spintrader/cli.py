@@ -554,7 +554,7 @@ def cmd_loop_run(args: argparse.Namespace) -> int:
     populating SPINTRADER_LIVE_VENUES and clearing READ_ONLY_API, which no code
     path here performs.
     """
-    from spintrader.loop.decision_loop import build_paper_loop
+    from spintrader.loop.decision_loop import build_paper_loop, ExecutionStyle
 
     settings = Settings.from_env()
     logging.basicConfig(
@@ -564,13 +564,15 @@ def cmd_loop_run(args: argparse.Namespace) -> int:
     symbols = list(args.symbols) or list(settings.crypto_universe)
 
     service = _build_mandate_service(settings, args.llm)
+    execution = ExecutionStyle.MAKER_FIRST if args.maker_first else ExecutionStyle.TAKER
     loop = build_paper_loop(symbols, settings=settings, mandate_service=service,
-                            with_regime=args.with_regime)
+                            with_regime=args.with_regime, execution=execution)
 
     print("=" * 74)
     print(f"{BOLD}Decision loop{RESET}  mode=PAPER  symbols={', '.join(symbols)}")
     print(f"  mandate source: {'LLM panel' if args.llm else 'quant bootstrap'}  "
-          f"regime={'on' if args.with_regime else 'off'}")
+          f"regime={'on' if args.with_regime else 'off'}  "
+          f"execution={execution.value}")
     print(f"  fast {args.fast_interval}s / slow {args.slow_interval}s"
           + (f" / max {args.max_ticks} ticks" if args.max_ticks else ""))
     print("=" * 74)
@@ -813,6 +815,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="use the LLM persona panel (default: quant bootstrap)")
     loop_run.add_argument("--with-regime", action="store_true",
                           help="fit the HMM regime model (needs hmmlearn)")
+    loop_run.add_argument("--maker-first", action="store_true",
+                          help="post passive limit orders to earn the maker fee, "
+                               "escalating to taker on timeout (exits stay taker)")
     loop_run.add_argument("--fast-interval", type=float, default=60.0,
                           help="seconds between fast ticks")
     loop_run.add_argument("--slow-interval", type=float, default=3600.0,

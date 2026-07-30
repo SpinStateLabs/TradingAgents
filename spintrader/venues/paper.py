@@ -217,20 +217,29 @@ class PaperVenue(Venue):
         return order
 
     def _fill_at_market(
-        self, order: Order, quote: Quote, cap_price: Decimal | None = None
+        self, order: Order, quote: Quote, cap_price: Decimal | None = None,
+        liquidity: str = "taker",
     ) -> Order:
-        # Cross the spread, then apply slippage on top.
-        touch = quote.ask if order.side is Side.BUY else quote.bid
-        notional_estimate = order.qty * touch
-        price = self._slippage.apply(touch, order.side, notional_estimate)
-
-        # A limit order can never fill worse than its limit, however bad the
-        # modelled slippage -- that is what a limit price means.
-        if cap_price is not None:
-            price = min(price, cap_price) if order.side is Side.BUY else max(price, cap_price)
+        if liquidity == "maker" and order.limit_price is not None:
+            # A passive (resting) limit that the market traded through fills at
+            # the price it posted -- it provided liquidity, so no spread is
+            # crossed and no adverse slippage is taken -- and earns the maker fee.
+            price = order.limit_price
+            fee_rate = order.instrument.maker_fee
+        else:
+            # Aggressive: cross the spread, then apply slippage on top, and pay
+            # the taker fee.
+            touch = quote.ask if order.side is Side.BUY else quote.bid
+            notional_estimate = order.qty * touch
+            price = self._slippage.apply(touch, order.side, notional_estimate)
+            # A limit order can never fill worse than its limit, however bad the
+            # modelled slippage -- that is what a limit price means.
+            if cap_price is not None:
+                price = min(price, cap_price) if order.side is Side.BUY else max(price, cap_price)
+            fee_rate = order.instrument.taker_fee
 
         gross = order.qty * price
-        fee = gross * order.instrument.taker_fee
+        fee = gross * fee_rate
 
         self._assert_affordable(order, gross, fee)
 
@@ -243,7 +252,7 @@ class PaperVenue(Venue):
             ts=self._now,
             fee=fee,
             fee_currency=self._currency,
-            liquidity="taker",
+            liquidity=liquidity,
             mode=order.mode,
         )
         self._apply_fill(order, fill)
@@ -327,7 +336,11 @@ class PaperVenue(Venue):
             try:
                 cap = order.limit_price if order.order_type in (
                     OrderType.LIMIT, OrderType.STOP_LIMIT) else None
-                self._fill_at_market(order, quote, cap_price=cap)
+                # A resting LIMIT the market traded through is a passive (maker)
+                # fill; a triggered STOP becomes an aggressive market order and
+                # pays taker.
+                liquidity = "maker" if order.order_type is OrderType.LIMIT else "taker"
+                self._fill_at_market(order, quote, cap_price=cap, liquidity=liquidity)
             except (InsufficientFunds, OrderRejected) as exc:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = str(exc)

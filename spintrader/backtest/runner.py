@@ -56,6 +56,7 @@ class CostModel:
 
     spread_bps: Decimal
     taker_fee: Decimal
+    maker_fee: Decimal
     slippage: SlippageModel
     price_increment: Decimal
     qty_increment: Decimal
@@ -82,6 +83,9 @@ class CostModel:
 EQUITY_COSTS = CostModel(
     spread_bps=Decimal("1"),
     taker_fee=Decimal("0.00005"),
+    # IBKR is commission-based, not maker/taker; a resting limit pays the same
+    # per-share commission, so there is no maker discount to model here.
+    maker_fee=Decimal("0.00005"),
     slippage=SlippageModel(
         base_bps=Decimal("0.5"),
         impact_coefficient=Decimal("2"),
@@ -99,6 +103,9 @@ EQUITY_COSTS = CostModel(
 CRYPTO_COSTS = CostModel(
     spread_bps=Decimal("3"),
     taker_fee=Decimal("0.0026"),
+    # Kraken's published maker tier at low volume: 0.16% vs the 0.26% taker.
+    # This is the whole point of maker-first execution at minute cadence.
+    maker_fee=Decimal("0.0016"),
     slippage=SlippageModel(
         base_bps=Decimal("2"),
         impact_coefficient=Decimal("8"),
@@ -143,7 +150,7 @@ def backtest_instrument(
         min_qty=Decimal("0"),
         min_notional=model.min_notional,
         supports_fractional=True,
-        maker_fee=Decimal("0"),
+        maker_fee=model.maker_fee,
         taker_fee=model.taker_fee,
     )
 

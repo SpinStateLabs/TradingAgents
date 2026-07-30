@@ -120,8 +120,58 @@ class AlwaysBuyStrategy:
         pass
 
 
+class OneShotBuyStrategy:
+    """Emits exactly one BUY entry, then nothing -- isolates order lifecycle."""
+    name = "oneshot"
+    warmup_bars = 2
+
+    def __init__(self):
+        self._fired = False
+
+    def on_bar(self, cursor, instrument, mandate):
+        if self._fired:
+            return []
+        self._fired = True
+        from spintrader.risk.engine import TradeIntent
+        return [TradeIntent(
+            instrument=instrument, side=Side.BUY, edge=D("0.05"),
+            confidence=D("0.9"), volatility=D("0.20"),
+            quote=cursor.quote(D("3")), strategy="oneshot",
+        )]
+
+    def fit(self, bars):
+        pass
+
+
+class BuyThenSellStrategy:
+    """BUY on the first bar, SELL a few bars later -- to test that the exit is
+    taker even under maker-first."""
+    name = "buysell"
+    warmup_bars = 2
+
+    def __init__(self):
+        self.n = 0
+
+    def on_bar(self, cursor, instrument, mandate):
+        from spintrader.risk.engine import TradeIntent
+        self.n += 1
+        if self.n == 1:
+            return [TradeIntent(instrument=instrument, side=Side.BUY, edge=D("0.05"),
+                                confidence=D("0.9"), volatility=D("0.20"),
+                                quote=cursor.quote(D("3")), strategy="entry")]
+        if self.n == 4:
+            return [TradeIntent(instrument=instrument, side=Side.SELL, edge=D("0.06"),
+                                confidence=D("1"), volatility=D("0.20"),
+                                quote=cursor.quote(D("3")), strategy="exit")]
+        return []
+
+    def fit(self, bars):
+        pass
+
+
 def make_loop(bars, *, aggression=Aggression.MODERATE, mode=TradingMode.PAPER,
-              starting_cash="10000", strategy=None, live_gate=None):
+              starting_cash="10000", strategy=None, live_gate=None,
+              execution=None, maker_timeout_ticks=3):
     """Wire a single-instrument paper loop over a fixed bar series."""
     instrument = backtest_instrument("BTC-USD", AssetClass.CRYPTO)
     store = FakeStore({instrument.key: bars})
@@ -146,11 +196,14 @@ def make_loop(bars, *, aggression=Aggression.MODERATE, mode=TradingMode.PAPER,
     risk = RiskEngine(settings=settings)
     strat = strategy or lenient_agent()
 
+    from spintrader.loop.decision_loop import ExecutionStyle
     loop = DecisionLoop(
         settings=settings, store=store, venue=venue, ledger=ledger, risk=risk,
         strategies={instrument.key: strat}, mandate_service=None,  # not used here
         instruments=[instrument], interval="1m", spread_bps=costs.spread_bps,
         horizon=Horizon.INTRADAY,
+        execution=execution or ExecutionStyle.TAKER,
+        maker_timeout_ticks=maker_timeout_ticks,
     )
     holder["loop"] = loop
     return loop, instrument, ledger, store
@@ -575,6 +628,73 @@ class BuildPaperLoopTests(unittest.TestCase):
         loop = self._loop(uptrend(60, step=0.3))
         mandate = loop.refresh_mandate()
         self.assertEqual(set(mandate.permitted), {loop.instruments[0].key})
+
+
+class MakerFirstTests(unittest.TestCase):
+    """Maker-first posts a passive limit to earn the maker fee, escalating to
+    taker on timeout; exits stay taker."""
+
+    def _maker_loop(self, bars, **kw):
+        from spintrader.loop.decision_loop import ExecutionStyle
+        return make_loop(bars, strategy=kw.pop("strategy", OneShotBuyStrategy()),
+                         execution=ExecutionStyle.MAKER_FIRST, **kw)
+
+    def test_entry_posts_a_resting_maker_limit(self):
+        loop, inst, ledger, _ = self._maker_loop(uptrend(40, step=0.3))
+        results = loop.fast_tick(permissive_mandate())
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].submitted)
+        self.assertEqual(results[0].filled_qty, D("0"))          # rests, not filled
+        self.assertEqual(ledger.position(inst.key).qty, D("0"))
+        self.assertIn(inst.key, loop._working)                    # tracked as working
+
+    def test_maker_limit_fills_as_maker_when_price_crosses(self):
+        bars = uptrend(40, step=0.3)
+        loop, inst, ledger, _ = self._maker_loop(bars)
+        loop.fast_tick(permissive_mandate())                      # posts the maker buy
+        drop = bars + [bar(40 + i, float(bars[-1].close) * 0.97) for i in range(3)]
+        loop.store.bars_by_key[inst.key] = drop
+        loop.fast_tick(permissive_mandate())                      # price crosses -> fills
+        self.assertGreater(ledger.position(inst.key).qty, D("0"))
+        fill = loop.venue.fills[-1]
+        self.assertEqual(fill.liquidity, "maker")
+        self.assertLess(fill.fee, fill.qty * fill.price * D("0.0026"))   # < taker fee
+        self.assertNotIn(inst.key, loop._working)                 # retired once filled
+
+    def test_unfilled_maker_escalates_to_taker(self):
+        bars = uptrend(60, step=0.3)
+        loop, inst, ledger, _ = self._maker_loop(bars, maker_timeout_ticks=2)
+        loop.fast_tick(permissive_mandate())                      # tick 1: post maker
+        loop.store.bars_by_key[inst.key] = uptrend(80, step=0.3)  # price keeps rising
+        loop.fast_tick(permissive_mandate())                      # tick 2: age 1
+        loop.fast_tick(permissive_mandate())                      # tick 3: age 2 -> escalate
+        self.assertGreater(ledger.position(inst.key).qty, D("0"))
+        self.assertEqual(loop.venue.fills[-1].liquidity, "taker")
+        self.assertNotIn(inst.key, loop._working)
+
+    def test_exit_is_taker_even_in_maker_first(self):
+        bars = uptrend(40, step=0.3)
+        loop, inst, ledger, _ = self._maker_loop(bars, strategy=BuyThenSellStrategy())
+        loop.fast_tick(permissive_mandate())                      # buy posts (maker)
+        # Fill the maker buy by dropping price, then keep ticking to the sell bar.
+        loop.store.bars_by_key[inst.key] = bars + [bar(40, float(bars[-1].close) * 0.97)]
+        loop.fast_tick(permissive_mandate())                      # maker buy fills
+        self.assertGreater(ledger.position(inst.key).qty, D("0"))
+        loop.fast_tick(permissive_mandate())                      # n=3, no intent
+        results = loop.fast_tick(permissive_mandate())            # n=4 -> SELL exit
+        self.assertTrue(any(r.reducing and r.submitted for r in results))
+        # The exit crossed the spread immediately (taker), it did not rest.
+        self.assertEqual(loop.venue.fills[-1].liquidity, "taker")
+        self.assertEqual(ledger.position(inst.key).qty, D("0"))
+
+    def test_taker_mode_unchanged(self):
+        # The default (taker) path fills a market order immediately, as before.
+        loop, inst, ledger, _ = make_loop(uptrend(40, step=0.3),
+                                          strategy=OneShotBuyStrategy())
+        results = loop.fast_tick(permissive_mandate())
+        self.assertGreater(results[0].filled_qty, D("0"))
+        self.assertEqual(loop.venue.fills[-1].liquidity, "taker")
+        self.assertFalse(loop._working)
 
 
 class DriverTests(unittest.TestCase):
