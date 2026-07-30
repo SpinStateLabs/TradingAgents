@@ -165,11 +165,14 @@ half that feeds it, in `spintrader/research/` and `spintrader/loop/improvement.p
 * `research/factory.py` — the **agent factory**: enumerates configurations of
   strategy *families* (a strategy class + base config + grid), in a fixed order,
   filtering combinations a family would reject. Each config has a stable content
-  hash over family + params. Two families ship, forecasting expected return in
-  opposite ways: `BaselineTrendAgent` (buy strength) and `MeanReversionAgent`
-  (buy weakness) -- so the search attacks the *edge*, not just the trend rule's
-  parameters. The improvement cycle re-backtests a champion with its own family's
-  class. New families drop in behind the same interface.
+  hash over family + params. **Five families** ship, each forecasting expected
+  return a different way: `BaselineTrendAgent` (buy strength), `MeanReversionAgent`
+  (buy weakness), `HighOrderMarkovAgent` (order-k return-symbol transitions),
+  `RegimeSwitchingAgent` (latent HMM state; needs `hmmlearn`, else stands aside),
+  and `HedgeEnsembleAgent` (a no-regret / game-theory ensemble over
+  momentum/reversion/breakout experts). The search attacks the *edge*, not just
+  one rule's parameters. The improvement cycle re-backtests a champion with its
+  own family's class. New families drop in behind the same interface.
 * `research/memory.py` — the **research memory**: records every candidate
   evaluated per objective (promoted or rejected, and why), so a round never
   re-tests — or re-counts — a configuration. Optionally persisted via the
@@ -199,12 +202,21 @@ annualised the Sharpe by the cost model's daily factor rather than the bar
 interval, which on 1m data inflated it ~38x and would have bypassed the gate
 (lessons L11).
 
-A **cross-family** round (trend + mean-reversion) on real 1m BTC found no edge in
-either family over the window — both lose ~0.15% out-of-sample and are rejected.
-That is the honest state of play: the machinery searches methodologies and
-refuses noise; an actual edge needs deeper data and more families. Data depth is
-accumulating — a universe 1m backfill (BTC/ETH/SOL/BNB, ~2 weeks) runs alongside
-the live collector; BTC already spans 2026-07-16 → now.
+A **cross-family** round over all five families on real 1m BTC found **no edge
+in any of them** — trend, reversion, Markov chain and Hedge all lose money
+out-of-sample and are rejected (the HMM regime family too, where it was run).
+That is the honest state of play: the machinery searches five methodologies and
+refuses all of the noise. Deeper data is now in hand — the universe 1m backfill
+completed (~2 weeks of BTC/ETH/SOL/BNB: BTC/ETH/SOL ~20.7k bars each, BNB ~9.5k,
+2026-07-16 → 30) — and the collector extends it forward.
+
+**Known limitation (perf):** the Markov and Hedge personas rebuild their
+window statistics every bar (O(window) per bar), and `RegimeSwitchingAgent`
+refits/​re-features the HMM on the trailing window, so a *large* 1m sweep is slow
+— a ~7-day, all-families search does not finish in minutes. They are correct and
+fine for daily data, short 1m windows, or bounded sweeps; a caching/vectorisation
+pass (incremental transition tables, cached features) is the follow-up before
+running them across the full universe at 1m. See lessons L12.
 
 ---
 

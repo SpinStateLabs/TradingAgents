@@ -246,3 +246,30 @@ the instrument. Derive it from the bar interval
 (`features.periods_per_year(interval, continuous=...)`), and test the intraday
 case explicitly — the daily case cannot expose an interval bug because its factor
 happens to be the default.
+
+---
+
+## L12 — A per-bar O(window) signal is fine on daily and quietly fatal at 1m
+
+**Learned:** 2026-07-30, running the Markov / regime / Hedge families on real 1m
+BTC.
+
+The new personas recompute window statistics every bar — the Markov chain
+rebuilds its transition table, Hedge replays its weight path, the regime agent
+re-features and refits the HMM. That is O(window) (or worse) per bar, i.e.
+O(window x bars) per backtest. On a few thousand *daily* bars it is instant; on
+tens of thousands of *1-minute* bars, across walk-forward folds and a grid of
+candidates, an all-families sweep does not finish in minutes. Unit tests on short
+synthetic series passed and said nothing about it.
+
+**Why it matters:** the self-improvement loop's value is running *many*
+candidates. A signal that is correct but O(window)/bar silently caps how much of
+the search space the loop can actually cover at the cadence it trades, and the
+cost only appears at that cadence and scale — not in the tests.
+
+**How to apply:** for anything in the backtest signal path intended for 1m,
+budget the per-bar cost as if it runs on tens of thousands of bars. Prefer
+incremental/rolling updates (a sliding transition count, cached features across
+refits) over rebuild-from-window-each-bar. When shipping a correct-but-slow
+version, say so with its complexity and the interval it is safe at — as the
+STATUS now does — rather than discovering it mid-sweep.
