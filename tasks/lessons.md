@@ -219,4 +219,30 @@ were present locally, so the suite was green against a tree git did not have.
 slash (`/data/`, not `data/`), and after adding one, run `git ls-files
 <source>/` on any source dir that shares the name to confirm it is still tracked.
 When a commit claims to add files, `git show HEAD:<path>` is the cheap check that
-it actually did.
+it actually did. The same trap lives in `ops/sync.sh`'s `tar --exclude='data'`
+(fixed to `--exclude='./data'`): any bare-name exclude — git or tar — matches
+that name at every depth, not just the root.
+
+---
+
+## L11 — Annualise by the bar interval, not the asset class
+
+**Learned:** 2026-07-30, running the improvement cycle on real 1-minute data.
+
+`run_backtest` annualised the scorecard with the cost model's `periods_per_year`
+(365 for crypto, 252 for equity) — values that assume *daily* bars. On 1-minute
+bars the correct factor is 525 600; using 365 understates it ~1440x and inflates
+the Sharpe by its square root (~38x). The deflated Sharpe is computed from that
+Sharpe, so the promotion gate — the one component whose whole job is to reject
+noise — would have waved through almost anything on intraday data.
+
+**Why it matters:** it is silent and it fails in the dangerous direction. Daily
+backtests were correct (365/252 match), so every existing test passed; the bug
+only appears at the resolution the whole minute-cadence system actually trades.
+A green suite proved nothing about the interval that mattered.
+
+**How to apply:** annualisation is a property of the observation frequency, not
+the instrument. Derive it from the bar interval
+(`features.periods_per_year(interval, continuous=...)`), and test the intraday
+case explicitly — the daily case cannot expose an interval bug because its factor
+happens to be the default.

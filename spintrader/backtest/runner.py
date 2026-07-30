@@ -306,6 +306,16 @@ def run_backtest(
     )
     cash = to_decimal(starting_cash)
 
+    # Annualise the scorecard by the ACTUAL bar interval, not the cost model's
+    # (which assumes daily bars). On 1-minute data, annualising with 365 instead
+    # of 525 600 understates the factor by ~38x and inflates the Sharpe by its
+    # square root -- enough to wave pure noise through the promotion gate. For
+    # daily bars this resolves to the same 252 (equity) / 365 (crypto) as before.
+    from spintrader.quant.features import periods_per_year as _periods_per_year
+    annualisation = int(_periods_per_year(
+        bars[0].interval, continuous=asset_class is AssetClass.CRYPTO,
+    ))
+
     kwargs = dict(strategy_kwargs or {})
     # The persona must price off the same spread the venue fills at.
     kwargs.setdefault("spread_bps", costs.spread_bps)
@@ -320,7 +330,7 @@ def run_backtest(
         starting_cash=cash,
         spread_bps=costs.spread_bps,
         slippage=costs.slippage,
-        periods_per_year=costs.periods_per_year,
+        periods_per_year=annualisation,
     )
 
     strategy = factory()

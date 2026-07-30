@@ -302,5 +302,46 @@ class ImprovementCycleTests(unittest.TestCase):
                             for v in r2.verdicts))
 
 
+class BacktestAnnualisationTests(unittest.TestCase):
+    """The scorecard must annualise by the bar interval, not a daily default.
+
+    On 1-minute data the wrong factor inflates the Sharpe ~38x and would wave
+    noise through the promotion gate; on daily data the factor is unchanged.
+    """
+
+    def _bars(self, interval, n=40):
+        from datetime import datetime, timedelta, timezone
+        from spintrader.core.types import Bar
+        step = {"1m": timedelta(minutes=1), "1d": timedelta(days=1)}[interval]
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        out = []
+        for i in range(n):
+            c = 100 + 0.1 * i
+            out.append(Bar(
+                instrument_key="paper:X-USD", ts=t0 + step * (i + 1),
+                interval=interval, open=D(str(c - 0.05)), high=D(str(c + 0.1)),
+                low=D(str(c - 0.1)), close=D(str(c)), volume=D("1"),
+            ))
+        return out
+
+    def _ppy(self, interval, asset_class):
+        from spintrader.backtest.runner import run_backtest
+        from spintrader.agents.personas.baseline_trend import BaselineTrendAgent
+        run = run_backtest(
+            BaselineTrendAgent, "X-USD", self._bars(interval),
+            asset_class=asset_class, walk_forward=False,
+        )
+        return run.result.scorecard.periods_per_year
+
+    def test_one_minute_crypto_annualises_by_minutes(self):
+        self.assertEqual(self._ppy("1m", AssetClass.CRYPTO), 525_600)
+
+    def test_daily_equity_annualisation_is_unchanged(self):
+        self.assertEqual(self._ppy("1d", AssetClass.EQUITY), 252)
+
+    def test_daily_crypto_annualisation_is_unchanged(self):
+        self.assertEqual(self._ppy("1d", AssetClass.CRYPTO), 365)
+
+
 if __name__ == "__main__":
     unittest.main()

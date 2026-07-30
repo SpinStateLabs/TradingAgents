@@ -2,8 +2,10 @@
 
 Last updated: 2026-07-29. Branch `spintrader-foundation`, 11 commits ahead of
 the `upstream` fork point (tasks 13 and 14 are uncommitted working-tree changes).
-**694 tests passing on Windows** (21 skipped — `hmmlearn` has no Python 3.14
-Windows wheel, so the HMM tests skip cleanly; the GB10 runs those too).
+**725 tests passing on Windows** (21 skipped — `hmmlearn` has no Python 3.14
+Windows wheel, so the HMM tests skip cleanly) and **746 on the GB10**, where the
+HMM tests run. Tasks 13, 14 and 19 have been exercised end-to-end on the GB10
+against the live Kraken endpoint and the real TimescaleDB.
 
 Nothing is pushed to a remote. Nothing trades live.
 
@@ -103,8 +105,11 @@ python -m spintrader.cli data backfill-1m BTC-USD --years 2      # long, resumab
 python -m spintrader.cli data backfill-1m --since 2023-01-01 --end 2023-02-01
 ```
 
-Verified end-to-end against the live endpoint: 2000 trades → 159 clean 1m bars,
-OHLC bounds and close-time alignment hold, forming minute dropped.
+Kraken rate-limits a deep backfill constantly (`EGeneral:Too many requests` after
+~30 rapid pages), so `backfill_1m` backs off exponentially and retries the same
+page rather than aborting the job. Verified on the GB10: backfilled BTC-USD from
+2026-07-26 to the live edge — 188 pages, 5874 1m bars into TimescaleDB, riding
+through rate limits, contiguous and resumable.
 
 ### 14 — two-tier decision loop (`spintrader/loop/`)
 
@@ -183,6 +188,13 @@ evaluated (already counted). Verified against real SPY data: four candidates,
 four trials, deflated Sharpe falling 0.88 → 0.57 as the count rose, all
 rejected. Nothing promoted is the correct, common outcome for a weak family —
 the loop refusing to ship noise is the feature.
+
+Also verified on the GB10 against **real 1-minute BTC** (4475 bars from the
+backfill above): every candidate lost money out-of-sample and was rejected — the
+expected result at minute cadence, where costs exceed the edge. This surfaced a
+real bug, now fixed: `run_backtest` annualised the Sharpe by the cost model's
+daily factor rather than the bar interval, which on 1m data inflated it ~38x and
+would have bypassed the gate (lessons L11).
 
 ---
 

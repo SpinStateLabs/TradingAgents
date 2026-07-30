@@ -66,11 +66,20 @@ API_BASE = "https://api.kraken.com"
 # requested. The cursor in the ``last`` field pages forward from there.
 TRADES_PER_PAGE = 1000
 
-# Public endpoints share a decaying rate-limit counter. One second between
-# calls keeps a multi-hour backfill comfortably under it; the endpoint is not
-# the bottleneck anyway -- aggregation is trivial next to the network round
-# trip.
+# Public endpoints share a decaying rate-limit counter. A backfill of any depth
+# WILL trip it -- measured: ~30 rapid calls exhaust it and Kraken answers
+# `EGeneral:Too many requests`. Aborting a multi-hour job on a transient limit is
+# useless, so backfill_1m backs off and retries the same page rather than
+# failing. One second between calls is the steady-state pace; the backoff handles
+# the bursts.
 DEFAULT_SLEEP_S = 1.0
+RATE_LIMIT_BACKOFF_S = 5.0
+MAX_RATE_LIMIT_RETRIES = 8
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "too many requests" in text or "rate limit" in text
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +348,8 @@ def backfill_1m(
     resume: bool = True,
     now: datetime | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
+    rate_limit_backoff_s: float = RATE_LIMIT_BACKOFF_S,
+    max_rate_limit_retries: int = MAX_RATE_LIMIT_RETRIES,
 ) -> dict[str, Any]:
     """Page the Trades endpoint forward and store aggregated 1-minute bars.
 
@@ -369,13 +380,28 @@ def backfill_1m(
     trades_seen = 0
     reached_live = False
     hit_end = False
+    rate_limited = 0
     prev_cursor: str | None = None
 
     while True:
         if max_pages is not None and pages >= max_pages:
             break
 
-        ticks, cursor = fetch(instrument, since)
+        # Fetch with backoff-and-retry on rate limiting. The same ``since`` is
+        # retried -- no page is skipped -- so a transient limit costs time, not
+        # data. Other feed errors are still fatal.
+        for attempt in range(max_rate_limit_retries + 1):
+            try:
+                ticks, cursor = fetch(instrument, since)
+                break
+            except FeedError as exc:
+                if not _is_rate_limited(exc) or attempt >= max_rate_limit_retries:
+                    raise
+                rate_limited += 1
+                backoff = min(rate_limit_backoff_s * (2 ** attempt), 60.0)
+                log.warning("kraken rate limit; backing off %.0fs (retry %d/%d)",
+                            backoff, attempt + 1, max_rate_limit_retries)
+                time.sleep(backoff)
         pages += 1
 
         if not ticks:
@@ -436,6 +462,7 @@ def backfill_1m(
         "written": written,
         "reached_live_edge": reached_live,
         "hit_end": hit_end,
+        "rate_limited": rate_limited,
         **coverage,
     }
 

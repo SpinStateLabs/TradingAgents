@@ -34,7 +34,7 @@ tar -C "$LOCAL_DIR" \
     --exclude='node_modules' \
     --exclude='assets' \
     --exclude='.env' \
-    --exclude='data' \
+    --exclude='./data' \
     -czf - . | "${SSH[@]}" "mkdir -p '$REMOTE_DIR' && tar -C '$REMOTE_DIR' -xzf -"
 
 echo "==> installing dependencies (uv sync)"

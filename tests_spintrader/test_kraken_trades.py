@@ -351,6 +351,47 @@ class BackfillTests(unittest.TestCase):
         # No bar with a close after the end bound.
         self.assertTrue(all(b.ts <= end for b in store.written))
 
+    def test_rate_limit_is_retried_not_fatal(self):
+        # A years-deep backfill trips Kraken's rate limit constantly; a transient
+        # limit must cost time, not abort the job or skip a page.
+        store = FakeStore()
+        calls = {"n": 0}
+
+        def fetch(instrument, since):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FeedError("kraken Trades BTC-USD: EGeneral:Too many requests")
+            if calls["n"] == 2:
+                return ([t(0, 10), t(1, 10)], "c1")     # the retried page
+            return ([], None)
+
+        result = backfill_1m(store, FakeVenue(), "BTC-USD", start=0, fetcher=fetch,
+                             sleep_s=0, rate_limit_backoff_s=0, now=self.now)
+        self.assertGreaterEqual(result["rate_limited"], 1)
+        self.assertTrue(store.written)                  # the retried page was not skipped
+        self.assertTrue(result["reached_live_edge"])
+
+    def test_non_rate_limit_error_stays_fatal(self):
+        store = FakeStore()
+
+        def fetch(instrument, since):
+            raise FeedError("kraken Trades BTC-USD: EGeneral:Invalid arguments")
+
+        with self.assertRaises(FeedError):
+            backfill_1m(store, FakeVenue(), "BTC-USD", start=0, fetcher=fetch,
+                        sleep_s=0, rate_limit_backoff_s=0, now=self.now)
+
+    def test_persistent_rate_limit_eventually_raises(self):
+        store = FakeStore()
+
+        def fetch(instrument, since):
+            raise FeedError("EGeneral:Too many requests")
+
+        with self.assertRaises(FeedError):
+            backfill_1m(store, FakeVenue(), "BTC-USD", start=0, fetcher=fetch,
+                        sleep_s=0, rate_limit_backoff_s=0, max_rate_limit_retries=2,
+                        now=self.now)
+
     def test_instrument_is_upserted(self):
         store = FakeStore()
         backfill_1m(store, FakeVenue(), "BTC-USD",
