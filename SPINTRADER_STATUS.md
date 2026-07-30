@@ -77,14 +77,32 @@ All five passed as of the last session.
 
 ## What remains
 
-Ordered by dependency.
+The numbered roadmap (1–19) is complete. Landed since the loop went in:
 
-- **16 — LLM recalibration agent** (daily). Guardrails already specified.
-- **17 — News/sentiment ingestion.** Adapt `tradingagents/dataflows/reddit.py`
-  and `stocktwits.py` rather than rewriting.
-- **18 — Adaptive tier escalation.** `PanelVerdict.escalate` is already set; the
-  LLM voter records it but the deep-model re-adjudication is not yet wired (there
-  is a hook in `spintrader/loop/voting.py`).
+- **16 — Daily reliability recalibration** (`spintrader/loop/recalibration.py`):
+  moves persona reliabilities toward realised Brier skill under guardrails.
+- **17 — News/sentiment ingestion** (`spintrader/data/sentiment.py`,
+  `spintrader/agents/personas/sentiment.py`): StockTwits/Reddit feed + a
+  long-only SentimentAgent.
+- **18 — Adaptive deep-tier escalation** (`spintrader/loop/voting.py`,
+  `mandate.py`): contested first-pass verdicts are re-adjudicated on the deep
+  model in one batched pass.
+- **Perf** (`spintrader/quant/features.py` + the Markov/Hedge/regime agents):
+  vectorised so a 7-day five-family 1m sweep runs in ~89s (was a timeout).
+- **Bar resampling** (`spintrader/data/resample.py`) + the **tradeable-horizon**
+  finding: costs bite less at a longer hold (baseline_trend −0.02% at 1m →
+  +0.02% at 15m on the full sample), but no gate-clearing OOS edge appears yet at
+  15m/1h — the data is thin (~1.4k 15m / ~350 hourly bars) and needs to
+  accumulate forward.
+- **Dashboard** (`spintrader/dashboard/`): `python -m spintrader.dashboard`
+  renders a self-contained HTML portfolio + forecast + mixture-of-experts panel.
+
+Follow-ons (not blockers): thread a per-fold sentiment mapping through
+`run_backtest` so the SentimentAgent joins the improve cycle (bars carry no
+sentiment channel today); accumulate more hourly/daily crypto history for a
+robust tradeable-horizon search; wire the recalibration + escalation into a
+scheduled daily driver. **No family has shown a real edge yet** — the honest
+state is that the search-and-refuse machinery works and correctly ships nothing.
 
 ---
 
