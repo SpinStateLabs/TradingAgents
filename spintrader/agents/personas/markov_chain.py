@@ -31,6 +31,7 @@ from decimal import Decimal
 from typing import Sequence
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 from spintrader.core.types import Bar, Instrument, Side, to_decimal
 from spintrader.quant.features import log_returns, periods_per_year, rolling_std
@@ -207,19 +208,31 @@ class HighOrderMarkovAgent:
         return symbols, state_mean
 
     def _forecast(self, symbols: np.ndarray) -> tuple[np.ndarray, int, int]:
-        """P(next state) for the current k-gram, backing off on thin support."""
-        current = tuple(symbols[-self.order:])
+        """P(next state) for the current k-gram, backing off on thin support.
+
+        Vectorised: each length-k window of symbols is encoded as a base-``n_states``
+        integer, so matching the current k-gram is one numpy equality over the
+        code array rather than an O(window*order) Python loop of tuple compares.
+        Integer arithmetic throughout, so the counts are identical to the naive
+        version -- just far faster, which matters on 1m data (lessons L12).
+        """
+        n = symbols.size
         for k in range(self.order, -1, -1):
-            counts = np.zeros(self.n_states)
-            gram = current[self.order - k:] if k > 0 else ()
-            # Count observed (k-gram -> next) pairs within the window.
-            for i in range(k, symbols.size):
-                if k == 0 or tuple(symbols[i - k:i]) == gram:
-                    counts[symbols[i]] += 1
-            support = int(counts.sum())
+            if k == 0:
+                counts = np.bincount(symbols, minlength=self.n_states).astype(float)
+                support = int(counts.sum())
+            elif n <= k:
+                continue
+            else:
+                powers = self.n_states ** np.arange(k - 1, -1, -1)
+                grams = sliding_window_view(symbols, k)[:n - k]   # grams[j] = symbols[j:j+k]
+                codes = grams @ powers                             # -> next symbol at index j+k
+                current_code = int(symbols[-k:] @ powers)
+                mask = codes == current_code
+                support = int(mask.sum())
+                counts = np.bincount(symbols[k:][mask], minlength=self.n_states).astype(float)
             if support >= self.min_support:
                 return counts / support, support, k
-        # Nothing met support even at order 0 (degenerate window).
         return np.full(self.n_states, 1.0 / self.n_states), 0, 0
 
     def _read(self, history: Sequence[Bar]) -> MarkovReading:

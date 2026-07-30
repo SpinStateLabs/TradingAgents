@@ -27,6 +27,7 @@ from decimal import Decimal
 from typing import Sequence
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 from spintrader.core.types import Bar, Instrument, Side, to_decimal
 from spintrader.quant.features import log_returns, periods_per_year, rolling_mean, rolling_std
@@ -189,16 +190,19 @@ class HedgeEnsembleAgent:
             z = np.where(std > 1e-12, (closes - mean) / std, 0.0)
         reversion = np.clip(-z / 2.0, -1.0, 1.0)      # buy dips, fade rallies
 
+        # Breakout: +1 above the prior window's high, -1 below its low. Vectorised
+        # over the full-window region via a sliding view (exact same max/min over
+        # the same strictly-prior windows), with the short warm-up done directly.
         breakout = np.zeros(n)
         w = self.breakout_window
-        for i in range(n):
-            lo = max(0, i - w)
-            prior = closes[lo:i]                       # strictly prior bars
-            if prior.size:
-                if closes[i] > prior.max():
-                    breakout[i] = 1.0
-                elif closes[i] < prior.min():
-                    breakout[i] = -1.0
+        if n > w:
+            prior = sliding_window_view(closes, w)[:n - w]     # prior[i-w] = closes[i-w:i]
+            cur = closes[w:n]
+            breakout[w:n] = np.where(cur > prior.max(axis=1), 1.0,
+                                     np.where(cur < prior.min(axis=1), -1.0, 0.0))
+        for i in range(1, min(w, n)):                          # warm-up: expanding prior
+            seg = closes[:i]
+            breakout[i] = 1.0 if closes[i] > seg.max() else (-1.0 if closes[i] < seg.min() else 0.0)
         return np.column_stack([momentum, reversion, breakout])
 
     def _hedge_weights(self, votes: np.ndarray, returns: np.ndarray) -> np.ndarray:
@@ -209,11 +213,15 @@ class HedgeEnsembleAgent:
         multiplicatively, so an expert that has been paying off gains influence.
         """
         n_experts = votes.shape[1]
-        log_w = np.zeros(n_experts)                    # work in log-space for stability
-        for i in range(1, votes.shape[0]):
-            reward = votes[i - 1] * returns[i]         # per-expert realised reward
-            log_w += self.eta * reward
-            log_w -= log_w.max()                       # keep it bounded
+        if votes.shape[0] < 2:
+            return np.full(n_experts, 1.0 / n_experts)
+        # The sequential multiplicative update is, after normalisation, exactly a
+        # softmax over each expert's cumulative reward -- the per-step max
+        # subtraction that kept the loop bounded cancels in the final ratio. So
+        # replace the O(window) Python loop with one vectorised dot product.
+        total_reward = (votes[:-1] * returns[1:, None]).sum(axis=0)
+        log_w = self.eta * total_reward
+        log_w -= log_w.max()
         w = np.exp(log_w)
         total = w.sum()
         return w / total if total > 0 else np.full(n_experts, 1.0 / n_experts)

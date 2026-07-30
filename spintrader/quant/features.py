@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
 from spintrader.core.types import Bar
 
@@ -88,23 +89,37 @@ def rolling_std(values: np.ndarray, window: int) -> np.ndarray:
 
     Positions before a full window are filled with the expanding std of what
     is available, never with a future-informed value.
+
+    Vectorised via a sliding-window view over the full-window region, with the
+    short warm-up prefix computed directly. It applies ``np.std(ddof=1)`` to
+    exactly the same slices as the naive loop, so the result is identical -- but
+    without an O(n*window) Python loop, which at minute cadence across thousands
+    of bars is the difference between a usable research sweep and an unusable one
+    (see lessons L12).
     """
+    values = np.asarray(values, dtype=float)
     n = values.size
     out = np.zeros(n, dtype=float)
-    for i in range(n):
-        lo = max(0, i - window + 1)
-        chunk = values[lo:i + 1]
-        out[i] = chunk.std(ddof=1) if chunk.size > 1 else 0.0
+    # Warm-up: indices with fewer than `window` observations expand. Index 0 is a
+    # single value, whose std is 0 -- left as the initialised zero.
+    for i in range(1, min(window - 1, n - 1) + 1):
+        out[i] = values[:i + 1].std(ddof=1)
+    if n >= window:
+        win = sliding_window_view(values, window)      # (n-window+1, window)
+        out[window - 1:] = win.std(axis=1, ddof=1)
     return out
 
 
 def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
-    """Trailing mean, same alignment as :func:`rolling_std`."""
+    """Trailing mean, same alignment as :func:`rolling_std`. Vectorised identically."""
+    values = np.asarray(values, dtype=float)
     n = values.size
     out = np.zeros(n, dtype=float)
-    for i in range(n):
-        lo = max(0, i - window + 1)
-        out[i] = values[lo:i + 1].mean()
+    for i in range(min(window - 1, n)):                # expanding warm-up prefix
+        out[i] = values[:i + 1].mean()
+    if n >= window:
+        win = sliding_window_view(values, window)
+        out[window - 1:] = win.mean(axis=1)
     return out
 
 

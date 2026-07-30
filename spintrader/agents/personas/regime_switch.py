@@ -66,6 +66,7 @@ class RegimeSwitchingAgent:
         n_states: int = 3,
         fit_window: int = 500,
         refit_interval: int = 250,
+        recompute_interval: int = 10,
         drift_window: int = 30,
         risk_on: Decimal | str | float = "0.40",
         risk_off: Decimal | str | float = "0.60",
@@ -84,6 +85,7 @@ class RegimeSwitchingAgent:
         self.n_states = n_states
         self.fit_window = fit_window
         self.refit_interval = max(1, refit_interval)
+        self.recompute_interval = max(1, recompute_interval)
         self.drift_window = drift_window
         self.risk_on = float(to_decimal(risk_on))
         self.risk_off = float(to_decimal(risk_off))
@@ -104,6 +106,8 @@ class RegimeSwitchingAgent:
         self._model = None
         self._bars_since_fit = 0
         self._regime_unavailable = False
+        self._regime_countdown = 0
+        self._cached_regime: tuple[float, float] | None = None
         self._long = False
         self._entry_mark: float | None = None
         self._peak_mark: float | None = None
@@ -142,6 +146,8 @@ class RegimeSwitchingAgent:
         self._model = None
         self._bars_since_fit = 0
         self._regime_unavailable = False
+        self._regime_countdown = 0
+        self._cached_regime = None
         self._long = False
         self._entry_mark = None
         self._peak_mark = None
@@ -228,21 +234,32 @@ class RegimeSwitchingAgent:
                 edge=0.0, confidence=0.0, fitted=False,
             )
 
-        from spintrader.quant.regime import RegimeError
-        try:
-            features = build_features(
-                history[-self.fit_window:], interval=self.interval,
-                continuous=self.continuous,
-            )
-            state = model.filter_latest(features)
-            risk_score = float(state.risk_score)
-            regime_confidence = float(state.confidence)
-        except (ValueError, RegimeError):
-            return RegimeSwitchReading(
-                close=close, risk_score=0.0, regime_confidence=0.0, drift=drift,
-                annual_vol=annual_vol, vol_ok=vol_ok, risk_on=False, bullish=False,
-                edge=0.0, confidence=0.0, fitted=False,
-            )
+        # Re-infer the regime only every `recompute_interval` bars, reusing the
+        # last inference in between. Regimes are sticky by construction (the HMM
+        # rejects states lasting under a few bars), so this turns a per-bar
+        # forward pass + feature build into an occasional one -- the difference
+        # between a usable and an unusable 1m sweep (lessons L12). The drift and
+        # volatility that gate the entry are still recomputed every bar.
+        if self._cached_regime is None or self._regime_countdown <= 0:
+            from spintrader.quant.regime import RegimeError
+            try:
+                features = build_features(
+                    history[-self.fit_window:], interval=self.interval,
+                    continuous=self.continuous,
+                )
+                state = model.filter_latest(features)
+                self._cached_regime = (float(state.risk_score), float(state.confidence))
+                self._regime_countdown = self.recompute_interval
+            except (ValueError, RegimeError):
+                self._cached_regime = None
+                return RegimeSwitchReading(
+                    close=close, risk_score=0.0, regime_confidence=0.0, drift=drift,
+                    annual_vol=annual_vol, vol_ok=vol_ok, risk_on=False, bullish=False,
+                    edge=0.0, confidence=0.0, fitted=False,
+                )
+        else:
+            self._regime_countdown -= 1
+        risk_score, regime_confidence = self._cached_regime
 
         risk_on = risk_score <= self.risk_on
         bullish = risk_on and drift > 0 and vol_ok

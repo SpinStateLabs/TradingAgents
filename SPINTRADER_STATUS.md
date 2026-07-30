@@ -210,13 +210,15 @@ refuses all of the noise. Deeper data is now in hand — the universe 1m backfil
 completed (~2 weeks of BTC/ETH/SOL/BNB: BTC/ETH/SOL ~20.7k bars each, BNB ~9.5k,
 2026-07-16 → 30) — and the collector extends it forward.
 
-**Known limitation (perf):** the Markov and Hedge personas rebuild their
-window statistics every bar (O(window) per bar), and `RegimeSwitchingAgent`
-refits/​re-features the HMM on the trailing window, so a *large* 1m sweep is slow
-— a ~7-day, all-families search does not finish in minutes. They are correct and
-fine for daily data, short 1m windows, or bounded sweeps; a caching/vectorisation
-pass (incremental transition tables, cached features) is the follow-up before
-running them across the full universe at 1m. See lessons L12.
+**Perf (fixed).** The Markov/Hedge/regime personas were O(window) per bar, so a
+large 1m sweep was unusable (a 7-day, all-families search timed out). Now
+vectorised — `rolling_std`/`rolling_mean` via sliding-window views (bit-exact),
+the Markov k-gram match via integer codes, the Hedge weight replay as a single
+dot product (the per-step renormalisation cancels), and `RegimeSwitchingAgent`
+re-infers the HMM only every `recompute_interval` bars (regimes are sticky), with
+output equality pinned by `test_perf_equivalence.py`. A **7-day, five-family
+sweep over 10,863 1m BTC bars now runs in ~89s on the GB10** (was a timeout). See
+lessons L12.
 
 ---
 
