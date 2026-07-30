@@ -407,6 +407,9 @@ def cmd_quote(args: argparse.Namespace) -> int:
 STRATEGIES = {
     "baseline_trend": "spintrader.agents.personas.baseline_trend:BaselineTrendAgent",
     "mean_reversion": "spintrader.agents.personas.mean_reversion:MeanReversionAgent",
+    "markov_chain": "spintrader.agents.personas.markov_chain:HighOrderMarkovAgent",
+    "regime_switch": "spintrader.agents.personas.regime_switch:RegimeSwitchingAgent",
+    "hedge_ensemble": "spintrader.agents.personas.hedge:HedgeEnsembleAgent",
 }
 
 

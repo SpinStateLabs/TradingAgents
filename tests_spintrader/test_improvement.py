@@ -323,10 +323,10 @@ def two_small_families():
 
 
 class MultiFamilyTests(unittest.TestCase):
-    def test_default_families_span_trend_and_mean_reversion(self):
+    def test_default_families_include_trend_and_mean_reversion(self):
         from spintrader.research.factory import default_families
         families = {c.family for c in CandidateFactory(families=default_families()).all_configs()}
-        self.assertEqual(families, {"trend", "mean_reversion"})
+        self.assertTrue({"trend", "mean_reversion"} <= families)
 
     def test_configs_carry_their_own_strategy_class(self):
         from spintrader.agents.personas.baseline_trend import BaselineTrendAgent

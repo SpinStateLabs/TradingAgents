@@ -31,7 +31,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from spintrader.agents.personas.baseline_trend import BaselineTrendAgent
+from spintrader.agents.personas.hedge import HedgeEnsembleAgent
+from spintrader.agents.personas.markov_chain import HighOrderMarkovAgent
 from spintrader.agents.personas.mean_reversion import MeanReversionAgent
+from spintrader.agents.personas.regime_switch import RegimeSwitchingAgent
 
 # --- trend family -----------------------------------------------------------
 
@@ -60,6 +63,40 @@ MEANREV_GRID: dict[str, Sequence[Any]] = {
     "lookback": (30, 60, 120),
     "entry_z": ("1.0", "1.5", "2.0"),
     "trail_pct": ("0.05", "0.08"),
+}
+
+# --- high-order Markov chain family -----------------------------------------
+
+MARKOV_BASE: dict[str, Any] = {
+    "order": 1, "n_states": 3, "lookback": 200, "dead_zone": "0.25",
+    "stop_pct": "0.05", "trail_pct": "0.08",
+}
+MARKOV_GRID: dict[str, Sequence[Any]] = {
+    "order": (1, 2, 3),
+    "n_states": (2, 3),
+    "lookback": (200, 400),
+}
+
+# --- Markov regime-switching family (HMM; needs hmmlearn to actually fit) ----
+
+REGIME_BASE: dict[str, Any] = {
+    "n_states": 3, "fit_window": 500, "refit_interval": 250,
+    "risk_on": "0.40", "risk_off": "0.60", "drift_window": 30,
+}
+REGIME_GRID: dict[str, Sequence[Any]] = {
+    "n_states": (2, 3),
+    "risk_on": ("0.34", "0.40"),
+}
+
+# --- game-theory (no-regret / Hedge) family ---------------------------------
+
+HEDGE_BASE: dict[str, Any] = {
+    "lookback": 200, "eta": "2.0", "entry_threshold": "0.15",
+    "fast_window": 10, "slow_window": 30,
+}
+HEDGE_GRID: dict[str, Sequence[Any]] = {
+    "eta": ("1.0", "2.0", "4.0"),
+    "entry_threshold": ("0.1", "0.2"),
 }
 
 
@@ -94,9 +131,31 @@ def mean_reversion_family() -> StrategyFamily:
                           {k: tuple(v) for k, v in MEANREV_GRID.items()}, _meanrev_valid)
 
 
+def markov_family() -> StrategyFamily:
+    return StrategyFamily("markov_chain", HighOrderMarkovAgent, dict(MARKOV_BASE),
+                          {k: tuple(v) for k, v in MARKOV_GRID.items()})
+
+
+def regime_switching_family() -> StrategyFamily:
+    return StrategyFamily("regime_switch", RegimeSwitchingAgent, dict(REGIME_BASE),
+                          {k: tuple(v) for k, v in REGIME_GRID.items()})
+
+
+def hedge_family() -> StrategyFamily:
+    return StrategyFamily("hedge", HedgeEnsembleAgent, dict(HEDGE_BASE),
+                          {k: tuple(v) for k, v in HEDGE_GRID.items()})
+
+
 def default_families() -> list[StrategyFamily]:
-    """Both shipped families -- trend and mean reversion."""
-    return [trend_family(), mean_reversion_family()]
+    """Every shipped family, forecasting expected return a different way.
+
+    trend / mean-reversion (price level), high-order Markov chain (return-symbol
+    transitions), Markov regime-switching (latent HMM state), and a game-theory
+    no-regret ensemble. The regime family needs ``hmmlearn`` to fit and otherwise
+    stands aside; the rest are pure and run anywhere.
+    """
+    return [trend_family(), mean_reversion_family(), markov_family(),
+            regime_switching_family(), hedge_family()]
 
 
 @dataclass(slots=True)
@@ -192,7 +251,9 @@ class CandidateFactory:
 
 
 __all__ = [
-    "BASE_CONFIG", "DEFAULT_GRID", "MEANREV_BASE", "MEANREV_GRID", "TREND_BASE",
-    "TREND_GRID", "CandidateConfig", "CandidateFactory", "StrategyFamily",
-    "default_families", "mean_reversion_family", "trend_family",
+    "BASE_CONFIG", "DEFAULT_GRID", "HEDGE_BASE", "HEDGE_GRID", "MARKOV_BASE",
+    "MARKOV_GRID", "MEANREV_BASE", "MEANREV_GRID", "REGIME_BASE", "REGIME_GRID",
+    "TREND_BASE", "TREND_GRID", "CandidateConfig", "CandidateFactory",
+    "StrategyFamily", "default_families", "hedge_family", "markov_family",
+    "mean_reversion_family", "regime_switching_family", "trend_family",
 ]
