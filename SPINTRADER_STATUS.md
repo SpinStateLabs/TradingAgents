@@ -192,12 +192,19 @@ four trials, deflated Sharpe falling 0.88 → 0.57 as the count rose, all
 rejected. Nothing promoted is the correct, common outcome for a weak family —
 the loop refusing to ship noise is the feature.
 
-Also verified on the GB10 against **real 1-minute BTC** (4475 bars from the
-backfill above): every candidate lost money out-of-sample and was rejected — the
-expected result at minute cadence, where costs exceed the edge. This surfaced a
-real bug, now fixed: `run_backtest` annualised the Sharpe by the cost model's
-daily factor rather than the bar interval, which on 1m data inflated it ~38x and
-would have bypassed the gate (lessons L11).
+Also verified on the GB10 against **real 1-minute BTC**: every candidate lost
+money out-of-sample and was rejected — the expected result at minute cadence,
+where costs exceed the edge. This surfaced a real bug, now fixed: `run_backtest`
+annualised the Sharpe by the cost model's daily factor rather than the bar
+interval, which on 1m data inflated it ~38x and would have bypassed the gate
+(lessons L11).
+
+A **cross-family** round (trend + mean-reversion) on real 1m BTC found no edge in
+either family over the window — both lose ~0.15% out-of-sample and are rejected.
+That is the honest state of play: the machinery searches methodologies and
+refuses noise; an actual edge needs deeper data and more families. Data depth is
+accumulating — a universe 1m backfill (BTC/ETH/SOL/BNB, ~2 weeks) runs alongside
+the live collector; BTC already spans 2026-07-16 → now.
 
 ---
 
