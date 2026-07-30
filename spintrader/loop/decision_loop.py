@@ -188,9 +188,13 @@ class DecisionLoop:
         data_keys: Mapping[str, str] | None = None,
         execution: ExecutionStyle = ExecutionStyle.TAKER,
         maker_timeout_ticks: int = 3,
+        run_id: str = "live",
     ) -> None:
         self.settings = settings
         self.store = store
+        # Identifies this session's rows in the equity_curve table, so a paper
+        # run and a live run accumulate as distinct curves under one mode.
+        self.run_id = run_id
         self.venue = venue
         self.ledger = ledger
         self.risk = risk
@@ -314,6 +318,11 @@ class DecisionLoop:
                 result = self._execute(intent, mandate, marks, now)
                 if result is not None:
                     results.append(result)
+
+        # 3. Persist this tick's mark so the loop's equity accumulates across
+        #    runs. Best-effort: the book has already moved: a store hiccup here
+        #    must not stop trading, exactly as _persist treats a decision.
+        self._persist_equity(marks, now)
         return results
 
     def _close_only_mandate(self, instrument_key: str, now: datetime) -> Mandate:
@@ -496,6 +505,25 @@ class DecisionLoop:
         except Exception as exc:                        # noqa: BLE001 - non-fatal
             log.debug("could not persist decision %s: %s", decision.decision_id, exc)
 
+    def _persist_equity(self, marks: Mapping[str, Decimal], now: datetime) -> None:
+        """Record one equity mark, best-effort (a store hiccup must not stop trading).
+
+        Values the book at the tick's marks -- the same prices the tick sized
+        against -- and upserts it under this loop's mode and ``run_id``. The
+        snapshot is written even when incomplete: the flag rides along, and an
+        honest partial mark beats a gap in the curve. Skipped silently if the
+        store has no equity writer (the loop runs against fakes that do not).
+        """
+        writer = getattr(self.store, "write_equity_point", None)
+        if writer is None:
+            return
+        try:
+            snapshot = self.ledger.value(prices=marks, now=now)
+            writer(snapshot, self.settings.mode.value, self.run_id,
+                   self.ledger.positions)
+        except Exception as exc:                        # noqa: BLE001 - non-fatal
+            log.debug("could not persist equity point at %s: %s", now, exc)
+
     # -- driver -----------------------------------------------------------
 
     def stop(self) -> None:
@@ -578,6 +606,7 @@ def build_paper_loop(
     slippage: SlippageModel | None = None,
     execution: ExecutionStyle = ExecutionStyle.TAKER,
     maker_timeout_ticks: int = 3,
+    run_id: str = "paper",
 ) -> DecisionLoop:
     """Wire a paper-mode loop over Kraken crypto symbols.
 
@@ -668,7 +697,7 @@ def build_paper_loop(
         strategies=strategies, mandate_service=mandate_service,
         instruments=instruments, interval=interval, spread_bps=costs.spread_bps,
         with_regime=with_regime, horizon=Horizon.INTRADAY, data_keys=data_keys,
-        execution=execution, maker_timeout_ticks=maker_timeout_ticks,
+        execution=execution, maker_timeout_ticks=maker_timeout_ticks, run_id=run_id,
     )
     loop_holder["loop"] = loop
     return loop

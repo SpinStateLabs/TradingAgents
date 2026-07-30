@@ -28,13 +28,24 @@ import hashlib
 import itertools
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from spintrader.agents.personas.baseline_trend import BaselineTrendAgent
 from spintrader.agents.personas.hedge import HedgeEnsembleAgent
 from spintrader.agents.personas.markov_chain import HighOrderMarkovAgent
 from spintrader.agents.personas.mean_reversion import MeanReversionAgent
 from spintrader.agents.personas.regime_switch import RegimeSwitchingAgent
+from spintrader.agents.personas.sentiment import SentimentAgent
+
+if TYPE_CHECKING:
+    from spintrader.core.types import Bar
+    from spintrader.data.sentiment import SentimentFeed
+
+# A per-fold context builder: given a window of bars it returns the extra
+# constructor kwargs a strategy needs but bars do not carry (a sentiment map,
+# say). ``run_backtest``/``walk_forward`` call it with the fold's own window.
+ContextProvider = Callable[[Sequence["Bar"]], "dict[str, Any]"]
 
 # --- trend family -----------------------------------------------------------
 
@@ -111,14 +122,52 @@ def _meanrev_valid(params: Mapping[str, Any]) -> bool:
     return int(params.get("lookback", MEANREV_BASE["lookback"])) >= 5
 
 
+# --- sentiment family -------------------------------------------------------
+#
+# Unlike the price families, the sentiment persona forecasts from a channel bars
+# do not carry, so its per-fold sentiment map is supplied through a
+# ``context_provider`` rather than a grid axis. The grid searches only the rule
+# parameters; the feed is threaded in per fold (see :func:`sentiment_family`).
+
+SENTIMENT_BASE: dict[str, Any] = {
+    "vol_lookback": 20, "entry_threshold": "0.35", "exit_threshold": "0.10",
+    "vol_ceiling": "2.0", "stop_pct": "0.05", "trail_pct": "0.08",
+    "min_mentions": 0,
+}
+SENTIMENT_GRID: dict[str, Sequence[Any]] = {
+    "entry_threshold": ("0.30", "0.35", "0.45"),
+    "exit_threshold": ("0.05", "0.10"),
+    "vol_lookback": (14, 20),
+}
+
+
+def _sentiment_valid(params: Mapping[str, Any]) -> bool:
+    # Mirror the persona's own constructor guards so a config it would reject is
+    # never counted as a trial: a hysteresis band (exit below entry) and enough
+    # lookback to estimate volatility.
+    entry = float(params.get("entry_threshold", SENTIMENT_BASE["entry_threshold"]))
+    exit_ = float(params.get("exit_threshold", SENTIMENT_BASE["exit_threshold"]))
+    lookback = int(params.get("vol_lookback", SENTIMENT_BASE["vol_lookback"]))
+    return lookback >= 5 and -1.0 < entry <= 1.0 and exit_ < entry
+
+
 @dataclass(slots=True)
 class StrategyFamily:
-    """A strategy class plus the base config and grid to search over it."""
+    """A strategy class plus the base config and grid to search over it.
+
+    ``context_provider`` is optional and, when set, is a *builder*: given the
+    run's symbol it returns a per-fold :data:`ContextProvider`. It exists for
+    families like sentiment whose strategy needs a per-bar series that bars do
+    not carry; the builder closes over the data source (a feed) and the per-fold
+    callable it returns is what slices that source to each fold's window. Price
+    families leave it ``None`` and are constructed from grid params alone.
+    """
     key: str
     strategy_cls: type
     base: dict[str, Any]
     grid: dict[str, Sequence[Any]]
     valid: Callable[[Mapping[str, Any]], bool] = lambda _p: True
+    context_provider: Callable[[str], ContextProvider] | None = None
 
 
 def trend_family() -> StrategyFamily:
@@ -144,6 +193,50 @@ def regime_switching_family() -> StrategyFamily:
 def hedge_family() -> StrategyFamily:
     return StrategyFamily("hedge", HedgeEnsembleAgent, dict(HEDGE_BASE),
                           {k: tuple(v) for k, v in HEDGE_GRID.items()})
+
+
+def sentiment_family(
+    feed: "SentimentFeed", interval_minutes: int = 1440,
+) -> StrategyFamily:
+    """A searchable :class:`~spintrader.agents.personas.sentiment.SentimentAgent`
+    family that carries a live sentiment ``feed``.
+
+    This is the seam that lets sentiment be searched like any other family. The
+    grid varies only the persona's rule parameters; the sentiment map itself is
+    injected per fold by the returned family's ``context_provider``. That
+    provider re-fetches and re-aligns the feed for **each fold's own window**,
+    which is what keeps a walk-forward causal here: a fold's sentiment is sliced
+    to ``[window_start, window_end]``, so it can never contain a score aligned to
+    a later fold's bar. The slice is inclusive of the window's own close-times
+    and excludes everything after, and the feed is fetched from one interval
+    before the window so the first bar's bucket is complete without reaching
+    forward.
+
+    ``interval_minutes`` is the sentiment bucketing cadence and should match the
+    bar interval (a daily backtest buckets sentiment daily -- 1440 minutes).
+    """
+    delta = timedelta(minutes=interval_minutes)
+
+    def provider_for(symbol: str) -> ContextProvider:
+        def provide(window: "Sequence[Bar]") -> dict[str, Any]:
+            if not window:
+                return {"sentiment": {}}
+            start, end = window[0].ts, window[-1].ts
+            mapping = feed.mapping(
+                symbol, since=start - delta, interval_minutes=interval_minutes,
+            )
+            # Scope to this fold's window: past enough to seed the first bar,
+            # never past its end. This inclusive slice is the causal guarantee.
+            scoped = {ts: sc for ts, sc in mapping.items() if start <= ts <= end}
+            return {"sentiment": scoped}
+
+        return provide
+
+    return StrategyFamily(
+        "sentiment", SentimentAgent, dict(SENTIMENT_BASE),
+        {k: tuple(v) for k, v in SENTIMENT_GRID.items()},
+        _sentiment_valid, context_provider=provider_for,
+    )
 
 
 def default_families() -> list[StrategyFamily]:
@@ -253,7 +346,8 @@ class CandidateFactory:
 __all__ = [
     "BASE_CONFIG", "DEFAULT_GRID", "HEDGE_BASE", "HEDGE_GRID", "MARKOV_BASE",
     "MARKOV_GRID", "MEANREV_BASE", "MEANREV_GRID", "REGIME_BASE", "REGIME_GRID",
-    "TREND_BASE", "TREND_GRID", "CandidateConfig", "CandidateFactory",
-    "StrategyFamily", "default_families", "hedge_family", "markov_family",
-    "mean_reversion_family", "regime_switching_family", "trend_family",
+    "SENTIMENT_BASE", "SENTIMENT_GRID", "TREND_BASE", "TREND_GRID",
+    "CandidateConfig", "CandidateFactory", "ContextProvider", "StrategyFamily",
+    "default_families", "hedge_family", "markov_family", "mean_reversion_family",
+    "regime_switching_family", "sentiment_family", "trend_family",
 ]

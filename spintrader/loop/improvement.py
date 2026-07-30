@@ -100,6 +100,9 @@ class ImprovementCycle:
         aggression: Aggression | str = Aggression.MODERATE,
         starting_cash: Decimal | str | float = "1000",
         n_candidates: int | None = None,
+        train_size: int | None = None,
+        test_size: int | None = None,
+        embargo: int | None = None,
     ) -> RoundResult:
         """Evaluate fresh candidates and promote the best that clears the gate."""
         profile = risk_profile(aggression)
@@ -114,7 +117,10 @@ class ImprovementCycle:
         if champion is not None:
             champion_cls = self._family_cls.get(champion.family, self.strategy_cls)
             inc_run = self._backtest(champion.config, symbol, bars, asset_class,
-                                     aggression, starting_cash, champion_cls)
+                                     aggression, starting_cash, champion_cls,
+                                     family_key=champion.family,
+                                     train_size=train_size, test_size=test_size,
+                                     embargo=embargo)
             incumbent_card = self._card(inc_run)
             incumbent_key = champion.config_key
 
@@ -130,7 +136,10 @@ class ImprovementCycle:
 
         for cfg in candidates:
             run = self._backtest(cfg.to_dict(), symbol, bars, asset_class,
-                                 aggression, starting_cash, cfg.strategy_cls)
+                                 aggression, starting_cash, cfg.strategy_cls,
+                                 family_key=cfg.family,
+                                 train_size=train_size, test_size=test_size,
+                                 embargo=embargo)
             wf = getattr(run, "walk_forward", None)
             if wf is None or wf.combined is None:
                 # Cannot evaluate (too few bars for a fold split). Record it as
@@ -179,13 +188,44 @@ class ImprovementCycle:
     # -- helpers -----------------------------------------------------------
 
     def _backtest(self, config, symbol, bars, asset_class, aggression, cash,
-                  strategy_cls=None):
+                  strategy_cls=None, family_key=None,
+                  train_size=None, test_size=None, embargo=None):
+        # A family may carry a per-fold context provider (sentiment does); route
+        # it to the backtester only when present, so a plain price backtest -- and
+        # a backtest_fn with no ``context_provider`` parameter -- is untouched.
+        # Fold sizing is opt-in the same way: forwarded only when set, so a
+        # ``backtest_fn`` (or test double) lacking those params is untouched, and
+        # None preserves the auto-sized default in ``run_backtest``.
+        extra: dict[str, Any] = {}
+        provider = self._context_provider(family_key, symbol)
+        if provider is not None:
+            extra["context_provider"] = provider
+        if train_size is not None:
+            extra["train_size"] = train_size
+        if test_size is not None:
+            extra["test_size"] = test_size
+        if embargo is not None:
+            extra["embargo"] = embargo
         return self.backtest_fn(
             strategy_cls or self.strategy_cls, symbol, bars,
             asset_class=asset_class, aggression=aggression,
             starting_cash=cash, walk_forward=True, n_trials=1,
-            strategy_kwargs=dict(config),
+            strategy_kwargs=dict(config), **extra,
         )
+
+    def _context_provider(self, family_key, symbol):
+        """The per-fold context provider for ``family_key`` bound to ``symbol``.
+
+        Resolved from ``self.factory`` at call time (not cached in ``__init__``)
+        because callers reassign ``cycle.factory`` between rounds.
+        """
+        if not family_key:
+            return None
+        for family in getattr(self.factory, "families", ()):
+            if family.key == family_key:
+                builder = getattr(family, "context_provider", None)
+                return builder(symbol) if builder is not None else None
+        return None
 
     @staticmethod
     def _card(run):

@@ -227,12 +227,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--objective", default="spy-daily", help="improvement objective label",
     )
+    parser.add_argument(
+        "--from-store", action="store_true",
+        help="read the real book from the store instead of the local demo",
+    )
+    parser.add_argument(
+        "--mode", default="paper", help="book mode to read with --from-store (default: paper)",
+    )
+    parser.add_argument(
+        "--run-id", default="paper", help="equity-curve run id with --from-store (default: paper)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-    print(f"Building dashboard from {args.csv} ...")
-    model = build_demo_dashboard(args.csv, args.symbol, args.objective)
+    if args.from_store:
+        from spintrader.dashboard.live import build_dashboard_from_store
+        from spintrader.data.store import Store
+
+        print(f"Building dashboard from the store ({args.mode}/{args.run_id}) ...")
+        with Store() as store:
+            model = build_dashboard_from_store(
+                store, mode=args.mode, run_id=args.run_id,
+                symbol=args.symbol, objective=args.objective,
+            )
+    else:
+        print(f"Building dashboard from {args.csv} ...")
+        model = build_demo_dashboard(args.csv, args.symbol, args.objective)
     html = render_html(model)
 
     out = args.out

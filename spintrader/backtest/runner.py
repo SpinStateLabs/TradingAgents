@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from spintrader.backtest.engine import (
     BacktestEngine, BacktestResult, WalkForwardResult,
@@ -301,8 +301,21 @@ def run_backtest(
     test_size: int | None = None,
     embargo: int | None = None,
     strategy_kwargs: dict[str, object] | None = None,
+    context_provider: Callable[[Sequence[Bar]], Mapping[str, object]] | None = None,
 ) -> BacktestRun:
-    """Replay ``bars`` through the live components and score the outcome."""
+    """Replay ``bars`` through the live components and score the outcome.
+
+    ``context_provider`` supplies per-run data a strategy needs that bars do not
+    carry -- the motivating case is a sentiment series, which the
+    :class:`~spintrader.agents.personas.sentiment.SentimentAgent` takes at
+    construction because the :class:`~spintrader.backtest.engine.ReplayCursor`
+    exposes only bars. Given a window of bars it returns extra constructor
+    kwargs (e.g. ``{"sentiment": <ts->score>}``). It is called with the whole
+    series for the single full-sample run and, crucially, **per fold with that
+    fold's own window** for the walk-forward, so a fold's injected data is
+    sliced to the fold and cannot come from a later one. Leaving it ``None``
+    preserves the old behaviour exactly.
+    """
     if len(bars) < 2:
         raise ValueError("need at least two bars to backtest")
 
@@ -329,8 +342,13 @@ def run_backtest(
     kwargs.setdefault("interval", bars[0].interval)
     kwargs.setdefault("continuous", asset_class is AssetClass.CRYPTO)
 
-    def factory():
-        return strategy_factory(**kwargs)
+    def factory(context: Mapping[str, object] | None = None):
+        # Fold context is merged last so an injected series (e.g. sentiment)
+        # overrides any placeholder in the base kwargs, never the reverse.
+        call_kwargs = dict(kwargs)
+        if context:
+            call_kwargs.update(context)
+        return strategy_factory(**call_kwargs)
 
     engine = BacktestEngine(
         settings=settings,
@@ -340,7 +358,10 @@ def run_backtest(
         periods_per_year=annualisation,
     )
 
-    strategy = factory()
+    # The full-sample run sees context built from the whole series; each fold
+    # below rebuilds it from the fold's own window (see ``context_provider``).
+    full_context = context_provider(bars) if context_provider is not None else None
+    strategy = factory(full_context)
     result = engine.run(strategy, instrument, bars, n_trials=n_trials)
 
     wf: WalkForwardResult | None = None
@@ -353,7 +374,7 @@ def run_backtest(
             wf = engine.walk_forward(
                 factory, instrument, bars,
                 train_size=train, test_size=test, embargo=gap,
-                n_trials=n_trials,
+                n_trials=n_trials, context_provider=context_provider,
             )
         else:
             log.warning(
@@ -485,16 +506,32 @@ def format_report(run: BacktestRun) -> str:
             lines.append(f"{count:>6}  {key}")
     lines.append("")
 
+    wf_combined = run.walk_forward.combined if run.walk_forward else None
     lines.append("-- significance " + "-" * 57)
     lines.append(f"PSR             {card.psr:.3f}  P(true Sharpe > 0)")
     lines.append(
         f"DSR             {card.deflated_sharpe:.3f}  "
         f"over {card.n_trials} trial(s)"
     )
-    lines.append(
-        f"verdict         "
-        f"{'SIGNIFICANT' if card.is_significant else 'NOT SIGNIFICANT'}"
-    )
+    if wf_combined is not None:
+        # The headline follows the walk-forward. A full-sample DSR can read
+        # significant off one lucky fold, so it is labelled in-sample only and the
+        # out-of-sample stitched result is the verdict of record.
+        lines.append(
+            f"in-sample       "
+            f"{'SIGNIFICANT' if card.is_significant else 'NOT SIGNIFICANT'}"
+            f"  (full series -- not the verdict)"
+        )
+        lines.append(
+            f"VERDICT         "
+            f"{'SIGNIFICANT' if wf_combined.is_significant else 'NOT SIGNIFICANT'}"
+            f"  (walk-forward, out of sample)"
+        )
+    else:
+        lines.append(
+            f"verdict         "
+            f"{'SIGNIFICANT' if card.is_significant else 'NOT SIGNIFICANT'}"
+        )
     lines.append("")
 
     if run.walk_forward and run.walk_forward.folds:

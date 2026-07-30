@@ -14,23 +14,95 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from spintrader.core.config import StorageConfig, get_settings
 from spintrader.core.types import (
-    Bar, Decision, Fill, Instrument, Order, Quote, ensure_utc, to_decimal,
+    Bar, Decision, Fill, Instrument, Order, Position, Quote, ensure_utc,
+    to_decimal,
 )
 
 log = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
+ZERO = Decimal("0")
+
 
 class StoreError(RuntimeError):
     """Database access failed."""
+
+
+# --------------------------------------------------------------------------
+# Read-side value types
+# --------------------------------------------------------------------------
+#
+# Reads return typed rows rather than raw tuples, for the same reason
+# ``read_bars`` returns :class:`Bar`s: the column order lives in exactly one
+# place, and a caller cannot silently transpose two fields. Monetary columns come
+# back as :class:`~decimal.Decimal` (the NUMERIC adapter already does this; the
+# constructors re-assert it) and every timestamp is aware UTC.
+
+@dataclass(frozen=True, slots=True)
+class EquityRow:
+    """One persisted mark of the book, straight from ``equity_curve``.
+
+    Mirrors :class:`~spintrader.portfolio.ledger.EquitySnapshot` in the fields the
+    schema keeps; ``positions`` is the decoded JSONB (instrument key -> a small
+    ``{qty, avg_cost, last_price}`` dict), enough to rebuild the open book without
+    the full ledger.
+    """
+    ts: datetime
+    mode: str
+    run_id: str
+    equity: Decimal
+    cash: Decimal
+    unrealized_pnl: Decimal
+    realized_pnl: Decimal
+    fees_paid: Decimal
+    gross_exposure: Decimal
+    positions: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionRow:
+    """One persisted decision, straight from ``decisions``."""
+    decision_id: str
+    instrument_key: str
+    ts: datetime
+    action: str
+    confidence: Decimal
+    target_weight: Decimal | None
+    horizon: str
+    regime: str | None
+    rationale: str
+    contributions: dict[str, Any]
+    metadata: dict[str, Any]
+    mode: str
+
+
+def _positions_payload(positions: Mapping[str, Position] | None) -> dict[str, Any]:
+    """Reduce a ledger position map to the compact JSON the schema stores.
+
+    Only non-flat positions are kept, and only the three fields a reader needs to
+    revalue them -- qty, basis, last mark. Decimals are stringified so the JSON
+    round-trips without float drift, matching how ``write_decision`` serialises.
+    """
+    out: dict[str, Any] = {}
+    for key, pos in (positions or {}).items():
+        if getattr(pos, "is_flat", pos.qty == ZERO):
+            continue
+        last = pos.last_price
+        out[key] = {
+            "qty": str(pos.qty),
+            "avg_cost": str(pos.avg_cost),
+            "last_price": None if last is None else str(last),
+        }
+    return out
 
 
 class Store:
@@ -294,6 +366,150 @@ class Store:
                 json.dumps(dict(decision.metadata), default=str), mode,
             ))
 
+    def read_decisions(
+        self,
+        mode: str,
+        instrument_key: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int | None = 100,
+    ) -> list[DecisionRow]:
+        """Recent decisions for ``mode``, most recent first.
+
+        Returns them descending because "the last thing the loop decided" is what
+        a dashboard leads with; a caller that wants chronological order can
+        reverse. ``limit`` defaults to 100 so an unbounded scan of a busy minute
+        loop is never the accidental default.
+        """
+        clauses = ["mode = %s"]
+        params: list[Any] = [mode]
+        if instrument_key is not None:
+            clauses.append("instrument_key = %s")
+            params.append(instrument_key)
+        if start is not None:
+            clauses.append("ts >= %s")
+            params.append(ensure_utc(start))
+        if end is not None:
+            clauses.append("ts <= %s")
+            params.append(ensure_utc(end))
+
+        sql = f"""
+            SELECT decision_id, instrument_key, ts, action, confidence,
+                   target_weight, horizon, regime, rationale, contributions,
+                   metadata, mode
+            FROM decisions WHERE {' AND '.join(clauses)}
+            ORDER BY ts DESC
+        """
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
+
+        with self.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+        return [
+            DecisionRow(
+                decision_id=r[0], instrument_key=r[1], ts=ensure_utc(r[2]),
+                action=r[3], confidence=to_decimal(r[4]),
+                target_weight=None if r[5] is None else to_decimal(r[5]),
+                horizon=r[6], regime=r[7], rationale=r[8] or "",
+                contributions=dict(r[9] or {}), metadata=dict(r[10] or {}), mode=r[11],
+            )
+            for r in rows
+        ]
+
+    # -- equity curve ------------------------------------------------------
+
+    def write_equity_point(
+        self,
+        snapshot: Any,
+        mode: str,
+        run_id: str = "live",
+        positions: Mapping[str, Position] | None = None,
+    ) -> None:
+        """Upsert one equity mark, keyed on (mode, run_id, ts).
+
+        Idempotent like every other write: the loop marks on a fixed cadence and
+        restarts replay the same instants, so a re-persisted mark must overwrite
+        rather than duplicate -- a doubled row would put a phantom step in the
+        curve. The primary-key columns are never in the SET clause, matching the
+        store's read-only-key discipline (a mark cannot migrate to another mode or
+        instant on update). ``snapshot`` is any
+        :class:`~spintrader.portfolio.ledger.EquitySnapshot`-shaped object.
+        """
+        import json
+        row = (
+            ensure_utc(snapshot.ts), mode, run_id,
+            to_decimal(snapshot.equity), to_decimal(snapshot.cash),
+            to_decimal(snapshot.unrealized_pnl), to_decimal(snapshot.realized_pnl),
+            to_decimal(snapshot.fees_paid), to_decimal(snapshot.gross_exposure),
+            json.dumps(_positions_payload(positions), default=str),
+        )
+        with self.cursor() as cur:
+            cur.execute("""
+                INSERT INTO equity_curve (
+                    ts, mode, run_id, equity, cash, unrealized_pnl, realized_pnl,
+                    fees_paid, gross_exposure, positions
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (mode, run_id, ts) DO UPDATE SET
+                    equity         = EXCLUDED.equity,
+                    cash           = EXCLUDED.cash,
+                    unrealized_pnl = EXCLUDED.unrealized_pnl,
+                    realized_pnl   = EXCLUDED.realized_pnl,
+                    fees_paid      = EXCLUDED.fees_paid,
+                    gross_exposure = EXCLUDED.gross_exposure,
+                    positions      = EXCLUDED.positions
+            """, row)
+
+    def read_equity_curve(
+        self,
+        mode: str,
+        run_id: str = "live",
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[EquityRow]:
+        """The equity curve for one (mode, run_id), in chronological order.
+
+        Queried descending so ``limit`` keeps the most *recent* marks, then
+        flipped to chronological -- the order a curve is drawn and the order a
+        return is compounded, exactly as ``read_bars`` does for bars.
+        """
+        clauses = ["mode = %s", "run_id = %s"]
+        params: list[Any] = [mode, run_id]
+        if start is not None:
+            clauses.append("ts >= %s")
+            params.append(ensure_utc(start))
+        if end is not None:
+            clauses.append("ts <= %s")
+            params.append(ensure_utc(end))
+
+        sql = f"""
+            SELECT ts, mode, run_id, equity, cash, unrealized_pnl, realized_pnl,
+                   fees_paid, gross_exposure, positions
+            FROM equity_curve WHERE {' AND '.join(clauses)}
+            ORDER BY ts DESC
+        """
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
+
+        with self.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+        return [
+            EquityRow(
+                ts=ensure_utc(r[0]), mode=r[1], run_id=r[2],
+                equity=to_decimal(r[3]), cash=to_decimal(r[4]),
+                unrealized_pnl=to_decimal(r[5]), realized_pnl=to_decimal(r[6]),
+                fees_paid=to_decimal(r[7]), gross_exposure=to_decimal(r[8]),
+                positions=dict(r[9] or {}),
+            )
+            for r in reversed(rows)
+        ]
+
     # -- research cache ----------------------------------------------------
 
     def cache_get(self, cache_key: str) -> dict[str, Any] | None:
@@ -337,4 +553,4 @@ class Store:
                   ttl_seconds, ttl_seconds))
 
 
-__all__ = ["Store", "StoreError", "SCHEMA_PATH"]
+__all__ = ["DecisionRow", "EquityRow", "Store", "StoreError", "SCHEMA_PATH"]

@@ -503,8 +503,13 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if card is None:
         return 1
     # A non-zero exit on an insignificant result keeps a promotion script from
-    # shipping noise. Reported either way; only the exit code is opinionated.
-    return 0 if card.is_significant else 2
+    # shipping noise. When a walk-forward ran, its stitched out-of-sample result
+    # is the verdict of record: a full-sample DSR can read significant off a single
+    # lucky fold (the BNB case), so the exit code follows the walk-forward, not the
+    # in-sample scorecard. Fall back to full-sample only when no WF was run.
+    wf = run.walk_forward
+    decisive = wf.combined if (wf is not None and wf.combined is not None) else card
+    return 0 if decisive.is_significant else 2
 
 
 def _build_mandate_service(settings: Settings, use_llm: bool):
@@ -657,6 +662,8 @@ def cmd_improve(args: argparse.Namespace) -> int:
         objective, args.symbol, bars, asset_class=asset_class,
         aggression=args.aggression or settings.aggression,
         starting_cash=args.cash, n_candidates=args.max_candidates,
+        train_size=args.train_size, test_size=args.test_size,
+        embargo=args.embargo,
     )
     print(f"  {result.summary()}")
     print("-" * 74)
@@ -872,6 +879,19 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument(
         "--max-candidates", type=int, default=None,
         help="cap candidates evaluated this round (default: all fresh grid points)",
+    )
+    improve.add_argument(
+        "--train-size", type=int, default=None,
+        help="walk-forward train window in bars (default: auto-sized to the series)",
+    )
+    improve.add_argument(
+        "--test-size", type=int, default=None,
+        help="walk-forward test window in bars; smaller yields more folds -- needed "
+             "to reach the 3-fold minimum on multi-year daily data",
+    )
+    improve.add_argument(
+        "--embargo", type=int, default=None,
+        help="bars skipped between train and test (default: the strategy warmup)",
     )
     improve.set_defaults(func=cmd_improve)
 

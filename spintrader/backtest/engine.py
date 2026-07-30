@@ -459,7 +459,7 @@ class BacktestEngine:
 
     def walk_forward(
         self,
-        strategy_factory: Callable[[], Strategy],
+        strategy_factory: Callable[..., Strategy],
         instrument: Instrument,
         bars: Sequence[Bar],
         train_size: int,
@@ -468,22 +468,41 @@ class BacktestEngine:
         anchored: bool = False,
         embargo: int = 0,
         n_trials: int = 1,
+        context_provider: Callable[[Sequence[Bar]], Mapping[str, object]] | None = None,
     ) -> WalkForwardResult:
         """Refit per fold and evaluate out-of-sample only.
 
         ``strategy_factory`` produces a fresh strategy for each fold. Reusing
         one instance would carry fitted state across folds and leak the future
         into earlier tests.
+
+        ``context_provider`` is the seam for data a strategy needs that bars do
+        not carry -- a per-bar sentiment series, say. When given, it is called
+        with *this fold's own test window* and its result is passed to the
+        factory, so each fold is built from data scoped to that fold and no
+        other. Building such context once, globally, and reusing it would let a
+        fold see values aligned to a later fold's bars; scoping it to the fold's
+        window is what keeps the walk-forward causal for the injected channel,
+        exactly as the cursor keeps it causal for price. The factory must accept
+        that context as its sole positional argument; a factory that ignores
+        extra data can keep its zero-argument form, since it is only called with
+        the context when a provider is supplied.
         """
         folds = make_folds(len(bars), train_size, test_size, step=step,
                            anchored=anchored, embargo=embargo)
+        # The name probe never needs fold context: a strategy's name is a class
+        # attribute, so a context-free construction is enough and avoids calling
+        # the provider with a window it has no fold for.
         name = getattr(strategy_factory(), "name", "strategy")
         out = WalkForwardResult(strategy=name, instrument_key=instrument.key)
 
         for fold in folds:
-            strategy = strategy_factory()
             train = bars[fold.train_start:fold.train_end]
             test = bars[fold.test_start:fold.test_end]
+            strategy = (
+                strategy_factory() if context_provider is None
+                else strategy_factory(context_provider(test))
+            )
 
             try:
                 strategy.fit(train)

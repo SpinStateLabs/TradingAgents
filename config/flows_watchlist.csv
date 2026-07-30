@@ -1,0 +1,71 @@
+ticker,group,role,flow_signal
+SPY,Risk barometer,US large cap,baseline risk-on
+QQQ,Risk barometer,US growth/Nasdaq,growth risk appetite
+IWM,Risk barometer,US small cap,small-cap risk appetite (IWM/SPY)
+RSP,Risk barometer,S&P equal weight,breadth vs cap-weight (RSP/SPY)
+DIA,Risk barometer,Dow / old economy,cyclical value tilt
+HYG,Credit,US high yield,"risk appetite (HYG/LQD, HYG/IEF)"
+JNK,Credit,US high yield (alt),confirm HYG
+LQD,Credit,US investment grade,IG demand
+EMB,Credit,EM sovereign debt,EM risk appetite
+TLT,Rates,20y+ Treasuries,flight-to-safety / duration
+IEF,Rates,7-10y Treasuries,mid duration
+SHY,Rates,1-3y Treasuries,cash-like / curve front end
+TIP,Rates,TIPS,inflation expectations (TIP/IEF)
+BIL,Rates,T-bills,true cash proxy
+^VIX,Volatility,S&P implied vol,fear gauge
+VIXY,Volatility,short-term VIX futures ETF,tradeable long-vol
+XLK,Sector,Technology,tech leadership
+XLC,Sector,Communications,mega-cap internet
+XLY,Sector,Consumer discretionary,cyclical (XLY/XLP = risk-on)
+XLP,Sector,Consumer staples,defensive
+XLF,Sector,Financials,rate/credit cycle
+XLE,Sector,Energy,commodity/inflation
+XLV,Sector,Health care,defensive growth
+XLI,Sector,Industrials,cyclical / PMI
+XLB,Sector,Materials,early-cycle commodity
+XLU,Sector,Utilities,defensive / bond proxy
+XLRE,Sector,Real estate,rate-sensitive
+SMH,Theme,Semiconductors,AI capex leadership
+SOXX,Theme,Semiconductors (alt),confirm SMH
+IGV,Theme,Software,software vs semis rotation
+QTUM,Theme,Quantum/computing,quantum proxy
+IWF,Factor,Growth,growth vs value (IWF/IWD)
+IWD,Factor,Value,value leadership
+MTUM,Factor,Momentum,momentum crowding
+QUAL,Factor,Quality,quality bid
+USMV,Factor,Min volatility,de-risking flows
+SPLV,Factor,Low volatility,defensive factor
+VLUE,Factor,Value (alt),value confirm
+GLD,Safe haven,Gold,monetary hedge
+SLV,Safe haven,Silver,gold confirm / industrial
+UUP,FX,US dollar bull,dollar liquidity (inverse risk)
+FXY,FX,Japanese yen,carry unwind / risk-off
+FXF,FX,Swiss franc,risk-off haven
+FXE,FX,Euro,dollar counter
+DBC,Commodity,Broad commodities,inflation flow
+USO,Commodity,Crude oil,energy demand
+UNG,Commodity,Natural gas,energy
+CPER,Commodity,Copper,Dr. Copper / growth
+DBA,Commodity,Agriculture,food inflation
+URA,Commodity,Uranium,energy transition
+XME,Commodity,Metals & mining,cyclical commodity equity
+EEM,Global,Emerging markets,EM risk appetite
+VWO,Global,EM (alt),EM confirm
+EFA,Global,Developed ex-US,intl vs US
+VGK,Global,Europe,Europe flows
+FXI,Global,China large cap,China risk
+MCHI,Global,China broad,China confirm
+EWJ,Global,Japan,Japan flows
+INDA,Global,India,India growth flows
+EWZ,Global,Brazil,LatAm / commodity EM
+ACWX,Global,World ex-US,US vs world (SPY/ACWX)
+BTC-USD,Crypto,Bitcoin,digital risk / liquidity
+ETH-USD,Crypto,Ethereum,crypto beta
+SOL-USD,Crypto,Solana,crypto high beta
+COIN,Crypto-proxy,Coinbase equity,crypto flow equity
+MSTR,Crypto-proxy,MicroStrategy,levered BTC proxy
+BTAL,Hedge,Anti-beta,long low-beta / short high-beta
+DBMF,Hedge,Managed futures,trend/CTA crisis alpha
+^TNX,Yield,10y Treasury yield,rate direction
+^IRX,Yield,13w T-bill yield,policy rate proxy
