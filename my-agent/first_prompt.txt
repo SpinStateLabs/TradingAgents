@@ -1,0 +1,12 @@
+Run today's volatility scan and paper-trading cycle.
+
+Universe to scan (liquid crypto pairs):
+BTC_USDT, ETH_USDT, SOL_USDT, BNB_USDT, XRP_USDT, DOGE_USDT, ADA_USDT, AVAX_USDT, LINK_USDT, TON_USDT, TRX_USDT, DOT_USDT, POL_USDT, LTC_USDT, BCH_USDT, NEAR_USDT, APT_USDT, ARB_USDT, OP_USDT, SUI_USDT
+
+Steps for this run (all dates relative to now — "today" = this run):
+1. Fetch recent OHLCV candles and current price for each pair from a public crypto market-data API (no API key needed for public data).
+2. Compute volatility metrics per pair — realized volatility, ATR as % of price, recent range expansion, and volume surge vs the trailing average — and rank the universe by volatility opportunity.
+3. Deep-dive the top 3–5 ranked pairs and decide which are tradeable (directional expansion, not chop).
+4. Load the paper portfolio from /mnt/memory/portfolio.json, mark open positions to current price, and close any that hit their stop or target since the last run.
+5. Produce a decision-ready trade brief for each selected opportunity (direction, entry, stop, target(s), size at 2% max risk, reward:risk, numeric volatility evidence, invalidation), respecting the portfolio caps.
+6. Open the new paper positions within the caps, save the updated portfolio back to /mnt/memory/portfolio.json, and write the full brief + portfolio snapshot to /mnt/session/outputs/brief-<today>.md.

@@ -1,0 +1,66 @@
+{
+  "problem": "Take advantage of crypto volatility to generate profit: scan a bounded universe, deep-dive the strongest candidates, produce a decision-ready trade brief (entry/exit/size/risk) per opportunity, and act on it via a simulated paper account. Ultimately an automated live trading agent.",
+  "founder_words": "I want to build a super agent that will take advantage of volatility. A decision-ready trade brief (entry/exit/size/risk). watch for universe, but not all at once. discover new opportunities as deep dive. take advantage means to generate profit. and then act on them. an automated trading agent.",
+  "agent": {
+    "name": "volatility-trader",
+    "market_v0": "crypto",
+    "model": "PICKED-AT-LAUNCH (newest Opus-class)"
+  },
+  "job": {
+    "core": "Each scheduled run: scan a ~20-pair liquid crypto universe with live public market data, measure volatility (realized vol / ATR% / range expansion / volume surge), rank and deep-dive the top 3-5, and produce a decision-ready trade brief (direction, entry, stop, target, size, reward:risk, thesis, invalidation) per opportunity. Then update a simulated paper portfolio.",
+    "scan_shape": "universe scanned each run; only top candidates deep-dived; opportunities discovered fresh each run"
+  },
+  "outcome": {
+    "criteria_file": "outcome.md",
+    "criteria_summary": [
+      "1-5 trade briefs, each with direction, entry, stop, target, size",
+      "position size honors the 2% max-risk-per-trade rule",
+      "each brief cites numeric volatility evidence",
+      "risk defined per trade: stop present and reward:risk >= 1.5",
+      "paper portfolio updated: marked to market, stops/targets honored, caps respected",
+      "single clean, actionable markdown brief"
+    ],
+    "max_iterations": 3
+  },
+  "inputs": {
+    "market_data": "live public crypto REST APIs (Crypto.com / Binance public endpoints) via web/bash tools - no key needed",
+    "volatility_signals": "realized volatility, ATR% of price, recent range expansion, volume surge vs trailing average",
+    "watchlist": ["BTC_USDT","ETH_USDT","SOL_USDT","BNB_USDT","XRP_USDT","DOGE_USDT","ADA_USDT","AVAX_USDT","LINK_USDT","TON_USDT","TRX_USDT","DOT_USDT","POL_USDT","LTC_USDT","BCH_USDT","NEAR_USDT","APT_USDT","ARB_USDT","OP_USDT","SUI_USDT"]
+  },
+  "outputs": {
+    "primary": "decision-ready trade brief per opportunity (entry/exit/size/risk) + updated paper portfolio snapshot",
+    "location": "/mnt/session/outputs/brief-<run-date>.md"
+  },
+  "environment": {
+    "type": "cloud",
+    "networking": "unrestricted (reaches public crypto data APIs)",
+    "packages": {"pip": ["pandas", "numpy", "requests"]}
+  },
+  "memory_store": {
+    "name": "paper-portfolio",
+    "access": "read_write",
+    "holds": "simulated account: cash, equity, open_positions[], closed_trades[]",
+    "seed": {"paper_capital_usd": 100000, "risk_per_trade_pct": 2, "max_concurrent_positions": 3, "max_portfolio_risk_pct": 6, "max_single_position_notional_pct": 25}
+  },
+  "execution_posture_v0": "simulated paper account in a memory store (no broker credential); real live prices, real P&L math",
+  "cadence": {
+    "type": "scheduled_deployment",
+    "cron": "0 8 * * *",
+    "timezone": "America/New_York",
+    "relative_dates_only": true
+  },
+  "evals": {
+    "have": "nothing formal yet",
+    "plan": "rubric IS the eval; today's first verified brief saved as evals/case-01/expected.md (regression baseline); accumulating paper-trade P&L becomes the true eval over the first weeks"
+  },
+  "credentials_needed_at_launch": [
+    {"name": "ANTHROPIC_API_KEY", "where": "platform.claude.com -> API keys", "lands_in": "my-agent/.env"}
+  ],
+  "next_directions": [
+    {"version": "v1", "item": "Real crypto paper-trading exchange API (Alpaca Crypto paper or Binance/Bybit testnet) for real simulated fills", "reason": "needs an exchange API credential not in hand now", "mechanism": "vault environment_variable credential + environment networking:limited allowlist; swap the memory-ledger fills for exchange orders"},
+    {"version": "v2", "item": "Live, ask-before-execute", "reason": "possible but out of scope for first iteration; wire only after paper shows edge", "mechanism": "real exchange account, order tool behind always_ask permission policy + an interface that surfaces confirmations"},
+    {"version": "v3", "item": "Live, fully automated", "reason": "highest risk; only after evals prove consistent positive paper alpha", "mechanism": "remove the always_ask gate once trusted; keep hard risk caps"},
+    {"version": "v-next", "item": "Equity options volatility plays (IV rank, straddles/strangles, vol-crush around earnings)", "reason": "scheduled for a later version", "mechanism": "add options data source + options broker (Tradier/IBKR)"},
+    {"version": "v-next", "item": "Event-driven trigger on volatility spikes (VIX/IV/large-move webhook)", "reason": "alternative/addition to the daily scan", "mechanism": "your backend calls deployments/:id/run when a signal trips"}
+  ]
+}

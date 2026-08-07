@@ -1,0 +1,13 @@
+{
+  "name": "volatility-trader-env",
+  "config": {
+    "type": "cloud",
+    "networking": {
+      "type": "unrestricted"
+    },
+    "packages": {
+      "pip": ["pandas", "numpy", "requests"],
+      "npm": []
+    }
+  }
+}
