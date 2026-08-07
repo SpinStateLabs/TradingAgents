@@ -1,0 +1,17 @@
+{
+  "account_type": "paper",
+  "base_currency": "USD",
+  "starting_capital": 100000,
+  "cash": 100000,
+  "equity": 100000,
+  "risk_rules": {
+    "risk_per_trade_pct": 2,
+    "max_concurrent_positions": 3,
+    "max_portfolio_risk_pct": 6,
+    "max_single_position_notional_pct": 25,
+    "min_reward_to_risk": 1.5
+  },
+  "open_positions": [],
+  "closed_trades": [],
+  "notes": "Simulated paper account. Marked to live public market prices each run. No real orders are ever placed."
+}
